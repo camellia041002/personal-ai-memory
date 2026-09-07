@@ -1,0 +1,15 @@
+{
+  "name": "personal-ai-memory",
+  "version": "8.0.0-public.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check:config": "node scripts/validate-config.mjs wrangler.example.jsonc",
+    "check": "npm run test && npm run check:config",
+    "seed:sample": "node scripts/seed-sample.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,14 @@
+node_modules/
+.wrangler/
+.dev.vars
+.env
+.env.*
+!.env.example
+wrangler.jsonc
+*.sqlite
+*.sqlite3
+*.db
+logs/
+backups/
+coverage/
+dist/

@@ -1,0 +1,32 @@
+{
+  // Copy this file to wrangler.jsonc and replace every placeholder.
+  "name": "personal-ai-memory-example",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-04",
+  "workers_dev": true,
+  "vars": {
+    "ALLOWED_ORIGIN": "https://example.invalid"
+  },
+  "kv_namespaces": [
+    {
+      "binding": "MEMORY",
+      "id": "<KV_NAMESPACE_ID>"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "personal-ai-memory-example-db",
+      "database_id": "<D1_DATABASE_ID>"
+    }
+  ],
+  "vectorize": [
+    {
+      "binding": "VECTORIZE_INDEX",
+      "index_name": "personal-ai-memory-example-index"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  }
+}
