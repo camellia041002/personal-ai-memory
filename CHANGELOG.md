@@ -39,6 +39,7 @@
 - 增加 key、value、query、owner、note 和管理分页长度或数量上限。
 - CORS 改为使用显式 `ALLOWED_ORIGIN`，不再默认 `*`。
 - 补充公开 D1 schema、虚构样例、配置校验、纯函数测试和静态安全测试。
+- 增加安全的 KV-only 与 KV+Vectorize 部署档，分别覆盖早期基础能力和中期语义检索能力；两者不是历史源码的逐字发布。
 
 ## V7 — 2026-08
 

@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "check:config": "node scripts/validate-config.mjs wrangler.example.jsonc",
+    "check:config": "node scripts/validate-config.mjs wrangler.example.jsonc examples/kv-only/wrangler.example.jsonc examples/vector-search/wrangler.example.jsonc",
     "check": "npm run test && npm run check:config",
     "seed:sample": "node scripts/seed-sample.mjs"
   },

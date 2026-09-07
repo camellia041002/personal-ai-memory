@@ -5,6 +5,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import worker from "../src/worker.js";
+import kvOnlyWorker from "../examples/kv-only/worker.js";
+import vectorSearchWorker from "../examples/vector-search/worker.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -19,15 +21,22 @@ async function filesUnder(directory) {
   return result;
 }
 
-test("public worker accepts no URL-carried token", async () => {
-  const worker = await readFile(path.join(root, "src", "worker.js"), "utf8");
-  assert.doesNotMatch(worker, /pathname\.startsWith\(["']\/mcp\//);
-  assert.doesNotMatch(worker, /searchParams\.get\(["']token["']\)/i);
-  assert.match(worker, /request\.headers\.get\(["']Authorization["']\)/);
+test("public workers accept no URL-carried token", async () => {
+  const paths = [
+    path.join(root, "src", "worker.js"),
+    path.join(root, "examples", "kv-only", "worker.js"),
+    path.join(root, "examples", "vector-search", "worker.js"),
+  ];
+  for (const sourcePath of paths) {
+    const source = await readFile(sourcePath, "utf8");
+    assert.doesNotMatch(source, /pathname\.startsWith\(["']\/mcp\//);
+    assert.doesNotMatch(source, /searchParams\.get\(["']token["']\)/i);
+    assert.match(source, /request\.headers\.get\(["']Authorization["']\)/);
+  }
 });
 
 test("runtime routing rejects path tokens and accepts only a sufficiently long header token", async () => {
-  const token = "example-only-token-with-32-chars";
+  const token = "x".repeat(32);
   const env = { AUTH_TOKEN: token, ALLOWED_ORIGIN: "https://example.invalid" };
   const pathResponse = await worker.fetch(new Request(`https://example.invalid/mcp/${token}`), env);
   assert.equal(pathResponse.status, 404);
@@ -56,11 +65,32 @@ test("CORS preflight exposes no data and does not require a bearer token", async
   assert.equal(response.headers.get("Access-Control-Allow-Origin"), "https://example.invalid");
 });
 
-test("public worker has no unconditional all-memory tools", async () => {
-  const worker = await readFile(path.join(root, "src", "worker.js"), "utf8");
-  assert.doesNotMatch(worker, /name:\s*["']get_all_memories["']/);
-  assert.doesNotMatch(worker, /name:\s*["']list_memories["']/);
-  assert.match(worker, /confirmKey must exactly match key/);
+test("all three public profiles initialize with header authentication", async () => {
+  const token = "x".repeat(32);
+  for (const profile of [worker, kvOnlyWorker, vectorSearchWorker]) {
+    const response = await profile.fetch(new Request("https://example.invalid/mcp", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    }), { AUTH_TOKEN: token, ALLOWED_ORIGIN: "https://example.invalid" });
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.error, undefined);
+  }
+});
+
+test("public workers have no unconditional all-memory tools", async () => {
+  const paths = [
+    path.join(root, "src", "worker.js"),
+    path.join(root, "examples", "kv-only", "worker.js"),
+    path.join(root, "examples", "vector-search", "worker.js"),
+  ];
+  for (const sourcePath of paths) {
+    const source = await readFile(sourcePath, "utf8");
+    assert.doesNotMatch(source, /name:\s*["']get_all_memories["']/);
+    assert.doesNotMatch(source, /name:\s*["']list_memories["']/);
+    assert.match(source, /confirmKey must exactly match key/);
+  }
 });
 
 test("repository excludes private artifact and secret file types", async () => {

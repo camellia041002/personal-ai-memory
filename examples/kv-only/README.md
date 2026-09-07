@@ -1,0 +1,12 @@
+# KV only profile
+
+这是 V1 功能范围的安全重写版，不是历史 V1 源码。它只需要 Workers 与 KV，适合只想按 key 保存和读取少量长期记忆的部署者。
+
+提供 `save_memory`、`get_memory`、受限的 `find_memory_keys` 和带 `confirmKey` 的 `delete_memory`。它不提供全库内容读取、URL Token、OAuth、语义搜索或管理员接口。
+
+创建独立 KV 后，复制本目录的 `wrangler.example.jsonc` 为 `wrangler.jsonc`，替换占位 ID，并设置 Secret：
+
+```bash
+npx wrangler secret put AUTH_TOKEN --config wrangler.jsonc
+npx wrangler deploy --config wrangler.jsonc
+```

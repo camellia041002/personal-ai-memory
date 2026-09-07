@@ -1,0 +1,10 @@
+{
+  "name": "personal-ai-memory-kv-only-example",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-04",
+  "workers_dev": true,
+  "vars": { "ALLOWED_ORIGIN": "https://example.invalid" },
+  "kv_namespaces": [
+    { "binding": "MEMORY", "id": "<KV_NAMESPACE_ID>" }
+  ]
+}

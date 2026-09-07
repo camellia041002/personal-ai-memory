@@ -1,0 +1,14 @@
+{
+  "name": "personal-ai-memory-vector-example",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-04",
+  "workers_dev": true,
+  "vars": { "ALLOWED_ORIGIN": "https://example.invalid" },
+  "kv_namespaces": [
+    { "binding": "MEMORY", "id": "<KV_NAMESPACE_ID>" }
+  ],
+  "vectorize": [
+    { "binding": "VECTORIZE_INDEX", "index_name": "personal-ai-memory-vector-example-index" }
+  ],
+  "ai": { "binding": "AI" }
+}

@@ -2,6 +2,8 @@
 
 公开版保持 V8 的核心设计：KV 保存原文，D1 与 Vectorize 共同提供可恢复的检索索引，MCP 与管理员端点共享 Worker 入口但使用不同凭据。
 
+仓库同时提供两个较轻的安全部署档：KV-only 省略全部索引服务；Vector search 使用 KV 和 Vectorize，但省略 D1 精确检索及管理员状态表。完整 V8 仍是默认参考实现。
+
 ```mermaid
 flowchart LR
     C[MCP client] -->|Authorization Bearer AUTH_TOKEN| W[Cloudflare Worker]

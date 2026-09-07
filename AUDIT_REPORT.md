@@ -53,7 +53,7 @@
 
 归档正文、关系和代码注释中未发现第三方仓库链接、版权声明、作者署名、许可证头或明确的复制来源。源码表现为围绕该项目需求逐版生成和修改的单文件 Worker，实现调用 Cloudflare 的公开运行时 API，但不包含 Cloudflare SDK 源码。
 
-基于现有材料，没有需要继承的第三方许可证声明。公开版因此采用宽松的 MIT License，并暂以 `personal-ai-memory contributors` 为权利人标识。公开前维护者仍应确认希望展示的版权主体名称；本结论是代码来源审计结果，不是法律意见。
+基于现有材料，没有需要继承的第三方许可证声明。公开版因此采用宽松的 MIT License，并以 GitHub 用户名 `camellia041002` 为版权主体标识。本结论是代码来源审计结果，不是法律意见。
 
 ## Public-edition verification target
 

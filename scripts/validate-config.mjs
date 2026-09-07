@@ -51,23 +51,30 @@ export function stripJsonComments(input) {
 }
 
 export function validateConfig(config) {
-  const requiredBindings = ["MEMORY", "DB", "VECTORIZE_INDEX", "AI"];
   const bindings = [
     ...(config.kv_namespaces || []).map((item) => item.binding),
     ...(config.d1_databases || []).map((item) => item.binding),
     ...(config.vectorize || []).map((item) => item.binding),
     config.ai?.binding,
   ];
+  const requiredBindings = ["MEMORY"];
+  if ((config.vectorize || []).length) requiredBindings.push("VECTORIZE_INDEX", "AI");
+  if ((config.d1_databases || []).length) requiredBindings.push("DB", "VECTORIZE_INDEX", "AI");
   for (const binding of requiredBindings) {
     if (!bindings.includes(binding)) throw new Error(`Missing binding: ${binding}`);
   }
-  if (config.main !== "src/worker.js") throw new Error("main must point to src/worker.js");
+  if (typeof config.main !== "string" || !config.main.endsWith("worker.js")) {
+    throw new Error("main must point to a worker.js file");
+  }
   return true;
 }
 
 if (process.argv[1] && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, "/")}`).href) {
-  const path = process.argv[2] || "wrangler.example.jsonc";
-  const raw = await readFile(path, "utf8");
-  validateConfig(JSON.parse(stripJsonComments(raw)));
-  console.log(`${path}: valid JSONC with required bindings`);
+  const paths = process.argv.slice(2);
+  if (!paths.length) paths.push("wrangler.example.jsonc");
+  for (const path of paths) {
+    const raw = await readFile(path, "utf8");
+    validateConfig(JSON.parse(stripJsonComments(raw)));
+    console.log(`${path}: valid JSONC with required bindings`);
+  }
 }
