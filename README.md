@@ -68,6 +68,52 @@ AI 在项目中承担原型生成、代码修改建议和实现辅助。功能�
 
 这些分值是 V8 代码中的启发式规则，不是经过基准测试证明的通用最优参数。
 
+## 脱敏运行示例
+
+以下是使用虚构记忆时的简化返回示例。哈希、分数和错误文本用占位符表示，不是性能测试结果，也不来自生产数据。
+
+保存成功后，KV 与检索索引都会明确返回状态：
+
+```json
+{
+  "key": "project_garden-planner",
+  "kv": "ok",
+  "index": "ok",
+  "chunks": 1,
+  "model": "@cf/qwen/qwen3-embedding-0.6b",
+  "contentHash": "<sha256>"
+}
+```
+
+混合检索会合并 D1 精确短语候选与 Vectorize 语义候选。下面省略了仅用于排序的具体分值：
+
+```json
+{
+  "query": "薄荷浇水",
+  "count": 1,
+  "results": [
+    {
+      "key": "project_garden-planner",
+      "chunkIndex": 0,
+      "category": "project",
+      "exactMatch": true,
+      "chunk": "阳台种植计划使用三个花盆。下次检查薄荷和罗勒的浇水频率，并记录日照时长。"
+    }
+  ]
+}
+```
+
+如果 KV 已写入但 D1 或 Vectorize 索引失败，调用不会把原文保存误报为失败，而是返回待恢复状态：
+
+```json
+{
+  "key": "project_garden-planner",
+  "kv": "ok",
+  "index": "pending",
+  "error": "<sanitized index error>"
+}
+```
+
 ## 本地检查
 
 需要 Node.js 20 或更高版本。本仓库的测试和配置检查不依赖第三方 npm 包。
