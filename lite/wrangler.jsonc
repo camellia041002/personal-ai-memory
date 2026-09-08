@@ -1,7 +1,7 @@
 {
   "name": "personal-ai-memory-lite",
   "main": "worker.js",
-  "compatibility_date": "2026-09-09",
+  "compatibility_date": "2026-09-04",
   "workers_dev": true,
   "kv_namespaces": [
     { "binding": "MEMORY" }
