@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- 新增首页默认 Lite：独立的 `lite` 一键部署目录、自动 KV provisioning、单一普通权限 `MEMORY_TOKEN` 和 `workers.dev` 落地页。
+- README 改为 Lite 优先的四步流程，明确无需本机 Git、Node 或域名，但 Cloudflare 部署按钮会连接使用者的 GitHub/GitLab 并在其账号创建代码副本。
+- 增加 Lite 与索引版 AI 部署提示词、Cloudflare 资源、最小权限、交付清单和秘密禁区文档。
+- 明确数据由使用者自己的 Cloudflare 账号控制，但 Cloudflare、AI 客户端与模型仍会在服务或调用过程中处理相关内容。
 - 在保留 `/mcp` + Bearer 默认模式的同时，为三种公开 Worker 增加可选 `/mcp/<MCP_URL_TOKEN>` 便捷模式。
 - `MCP_URL_TOKEN` 只从 Cloudflare Secret 读取；未配置、格式无效、路径错误或多余层级均返回 `404`，且不能访问 `/admin/*`。
 - 将配置检查拆分为“模板结构有效”和“实际配置可部署”，实际模式拒绝占位符、空 ID 和明显无效的资源标识。

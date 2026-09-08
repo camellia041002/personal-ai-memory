@@ -57,7 +57,7 @@ export function stripJsonComments(input) {
 
 export function validateConfig(config, options = {}) {
   const mode = options.mode || "deploy";
-  if (!(["deploy", "template"].includes(mode))) throw new Error(`Unknown validation mode: ${mode}`);
+  if (!(["deploy", "template", "provision"].includes(mode))) throw new Error(`Unknown validation mode: ${mode}`);
   if (!config || typeof config !== "object" || Array.isArray(config)) {
     throw new Error("Configuration must be a JSON object");
   }
@@ -87,7 +87,9 @@ export function validateConfig(config, options = {}) {
 
   for (const item of config.kv_namespaces || []) {
     validateRequiredString(item?.binding, "KV binding", mode, RESOURCE_NAME_PATTERN);
-    validateRequiredString(item?.id, `KV namespace ID for ${item?.binding || "unknown binding"}`, mode, KV_ID_PATTERN);
+    if (!(mode === "provision" && item?.id === undefined)) {
+      validateRequiredString(item?.id, `KV namespace ID for ${item?.binding || "unknown binding"}`, mode, KV_ID_PATTERN);
+    }
   }
   for (const item of config.d1_databases || []) {
     validateRequiredString(item?.binding, "D1 binding", mode, RESOURCE_NAME_PATTERN);
@@ -134,14 +136,18 @@ function rejectPlaceholders(value, path = "config") {
 if (process.argv[1] && import.meta.url === new URL(`file:///${process.argv[1].replace(/\\/g, "/")}`).href) {
   const args = process.argv.slice(2);
   let mode = "deploy";
-  if (args[0] === "--template" || args[0] === "--deploy") mode = args.shift().slice(2);
+  if (["--template", "--deploy", "--provision"].includes(args[0])) mode = args.shift().slice(2);
   const paths = args;
   if (!paths.length) paths.push(mode === "template" ? "wrangler.example.jsonc" : "wrangler.jsonc");
   for (const path of paths) {
     try {
       const raw = await readFile(path, "utf8");
       validateConfig(JSON.parse(stripJsonComments(raw)), { mode });
-      const result = mode === "template" ? "valid template structure" : "deployable configuration valid";
+      const result = mode === "template"
+        ? "valid template structure"
+        : mode === "provision"
+          ? "valid automatic-provisioning configuration"
+          : "deployable configuration valid";
       console.log(`${path}: ${result}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

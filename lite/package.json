@@ -1,0 +1,16 @@
+{
+  "name": "personal-ai-memory-lite",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "cloudflare": {
+    "bindings": {
+      "MEMORY_TOKEN": {
+        "description": "Required. Generate a unique secret with at least 32 random bytes (43 base64url or 64 hex characters). Keep it private; it controls access to all memories."
+      },
+      "MEMORY": {
+        "description": "A new KV namespace that stores your memory text in your own Cloudflare account. Do not bind an existing production namespace."
+      }
+    }
+  }
+}

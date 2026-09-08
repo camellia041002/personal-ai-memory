@@ -1,4 +1,5 @@
 {
+  // Hybrid V8 manual-deployment template. New users should deploy ./lite instead.
   // Copy this file to wrangler.jsonc and replace every placeholder.
   // Store AUTH_TOKEN, ADMIN_TOKEN, and optional MCP_URL_TOKEN with `wrangler secret put`.
   "name": "personal-ai-memory-example",

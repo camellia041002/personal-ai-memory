@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import worker from "../src/worker.js";
 import kvOnlyWorker from "../examples/kv-only/worker.js";
+import liteWorker from "../lite/worker.js";
 import vectorSearchWorker from "../examples/vector-search/worker.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -25,6 +26,7 @@ test("public workers never accept query-parameter tokens or emit application log
   const paths = [
     path.join(root, "src", "worker.js"),
     path.join(root, "examples", "kv-only", "worker.js"),
+    path.join(root, "lite", "worker.js"),
     path.join(root, "examples", "vector-search", "worker.js"),
   ];
   for (const sourcePath of paths) {
@@ -57,6 +59,15 @@ test("all profiles preserve Bearer authentication on the exact /mcp route", asyn
     assert.equal(acceptedResponse.status, 200);
     assert.doesNotMatch(await acceptedResponse.text(), new RegExp(token));
   }
+
+  const liteToken = "l".repeat(43);
+  const liteMissing = await initialize(liteWorker, "/mcp", { MEMORY_TOKEN: liteToken });
+  assert.equal(liteMissing.status, 401);
+  const liteAccepted = await initialize(liteWorker, "/mcp", { MEMORY_TOKEN: liteToken }, {
+    Authorization: `Bearer ${liteToken}`,
+  });
+  assert.equal(liteAccepted.status, 200);
+  assert.doesNotMatch(await liteAccepted.text(), new RegExp(liteToken));
 
   const shortTokenResponse = await worker.fetch(new Request("https://example.invalid/mcp", {
     headers: { Authorization: "Bearer short" },
@@ -151,6 +162,7 @@ test("public workers have no unconditional all-memory tools", async () => {
   const paths = [
     path.join(root, "src", "worker.js"),
     path.join(root, "examples", "kv-only", "worker.js"),
+    path.join(root, "lite", "worker.js"),
     path.join(root, "examples", "vector-search", "worker.js"),
   ];
   for (const sourcePath of paths) {

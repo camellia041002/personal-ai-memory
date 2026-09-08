@@ -1,5 +1,15 @@
 # Security
 
+## Lite authentication
+
+首页默认部署的 Lite 只使用一个 Cloudflare Secret：`MEMORY_TOKEN`。同一个普通权限 Token 可通过两种载体使用：精确路径 `/mcp` 的 `Authorization: Bearer <MEMORY_TOKEN>`，或只支持 URL 的客户端使用精确路径 `/mcp/<MEMORY_TOKEN>`。Lite 没有管理员端点，因此不存在普通权限与管理员权限混用。
+
+`MEMORY_TOKEN` 必须来自至少 32 字节安全随机数，运行时要求不少于 43 个 URL-safe 字符，且只允许 ASCII 字母、数字、`-` 和 `_`。64 位十六进制值符合要求。错误、过短、未配置或多余路径均不会通过鉴权。
+
+Lite 的 Worker 与 KV 位于部署者自己的 Cloudflare 账号中，但 Cloudflare 仍承载服务和数据；调用工具时，AI 客户端及模型也会看到所请求和返回的记忆。本项目不提供端到端加密、客户端侧加密、OAuth、多租户隔离、审计日志或内置速率限制。
+
+以下章节中的 `AUTH_TOKEN`、`MCP_URL_TOKEN` 和 `ADMIN_TOKEN` 适用于索引版与 Hybrid V8。
+
 ## Supported authentication
 
 普通 MCP 提供两种连接方式：

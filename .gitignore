@@ -5,6 +5,7 @@ node_modules/
 .env.*
 !.env.example
 wrangler.jsonc
+!lite/wrangler.jsonc
 *.sqlite
 *.sqlite3
 *.db

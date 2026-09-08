@@ -33,6 +33,13 @@ test("all example configs have valid template structure", async () => {
   }
 });
 
+test("Lite one-click config requests automatic KV provisioning", async () => {
+  const raw = await readFile(path.join(root, "lite", "wrangler.jsonc"), "utf8");
+  const config = JSON.parse(stripJsonComments(raw));
+  assert.deepEqual(config.kv_namespaces, [{ binding: "MEMORY" }]);
+  assert.doesNotThrow(() => validateConfig(config, { mode: "provision" }));
+});
+
 test("a fully replaced Hybrid V8 config is deployable", () => {
   assert.doesNotThrow(() => validateConfig(validHybridConfig(), { mode: "deploy" }));
 });

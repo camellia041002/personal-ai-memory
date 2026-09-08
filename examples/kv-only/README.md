@@ -1,5 +1,7 @@
 # KV only profile
 
+> 新用户请使用仓库首页的 [`lite`](../../lite) 一键部署入口。这个目录保留旧的双 Token KV-only 公开实现，主要用于版本对照和回归测试，不再是默认部署路径。
+
 这是 V1 功能范围的安全重写版，不是历史 V1 源码。它只需要 Workers 与 KV，适合只想按 key 保存和读取少量长期记忆的部署者。
 
 提供 `save_memory`、`get_memory`、受限的 `find_memory_keys` 和带 `confirmKey` 的 `delete_memory`。它不提供全库内容读取、URL Token、OAuth、语义搜索或管理员接口。

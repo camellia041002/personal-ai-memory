@@ -1,8 +1,21 @@
 # Architecture
 
-公开版保持 V8 的核心设计：KV 保存原文，D1 与 Vectorize 共同提供可恢复的检索索引，MCP 与管理员端点共享 Worker 入口但使用不同凭据。
+公开版默认入口是 Lite：一个 Worker 通过 MCP 暴露四个受限工具，KV 是唯一存储。它不生成 embedding，也没有 D1、Vectorize 或管理员端点。
 
-仓库同时提供两个较轻的安全部署档：KV-only 省略全部索引服务；Vector search 使用 KV 和 Vectorize，但省略 D1 精确检索及管理员状态表。完整 V8 仍是默认参考实现。
+需要语义检索时可选择 Vector search，它使用 KV、Workers AI 和 Vectorize。Hybrid V8 再加入 D1，用于精确短语候选、当前 chunk 校验和索引状态恢复。三档都是安全整理后的公开实现，不是历史源码的原样副本。
+
+## Lite
+
+```mermaid
+flowchart LR
+    C[MCP client] -->|/mcp plus Bearer MEMORY_TOKEN| W[Cloudflare Worker]
+    U[URL-only client] -->|exact /mcp/MEMORY_TOKEN| W
+    W -->|save read list delete| K[(KV MEMORY)]
+```
+
+Lite 的 `find_memory_keys` 只搜索 key 名称，必须提供关键词或前缀，且最多返回 20 条。读取正文仍要求完整 key；删除必须提供完全一致的 `confirmKey`。
+
+## Hybrid V8
 
 ```mermaid
 flowchart LR

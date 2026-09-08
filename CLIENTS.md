@@ -1,5 +1,16 @@
 # Client connections
 
+## Lite（首页默认）
+
+Lite 只需要一个 `MEMORY_TOKEN`：
+
+- 推荐：`https://<worker>.workers.dev/mcp` + `Authorization: Bearer <MEMORY_TOKEN>`；
+- 只支持单 URL：`https://<worker>.workers.dev/mcp/<MEMORY_TOKEN>`。
+
+下面各客户端示例中的 `AUTH_TOKEN` 或 `MCP_URL_TOKEN`，在 Lite 中都替换为同一个 `MEMORY_TOKEN`。不要把 Cloudflare API Token 配置到 MCP 客户端。
+
+## 索引版与 Hybrid V8
+
 本项目提供两种普通 MCP 连接方式：
 
 - 默认推荐：`https://<worker>.workers.dev/mcp` + `Authorization: Bearer <AUTH_TOKEN>`；

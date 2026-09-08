@@ -1,0 +1,3 @@
+# Generate a unique value with at least 32 random bytes (43 base64url or 64 hex characters).
+# Never reuse an account password, API token, or another application's secret.
+MEMORY_TOKEN=

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import kvOnlyWorker from "../examples/kv-only/worker.js";
+import liteWorker from "../lite/worker.js";
 import vectorSearchWorker from "../examples/vector-search/worker.js";
 
 const token = "x".repeat(32);
@@ -75,6 +76,37 @@ test("KV-only profile saves, finds, reads, and confirms deletion", async () => {
     confirmKey: "project_demo",
   })).deleted, true);
   assert.equal(await env.MEMORY.get("project_demo"), null);
+});
+
+test("Lite uses one strong token for Bearer and URL-only connections", async () => {
+  const memoryToken = "l".repeat(43);
+  const env = { MEMORY: new MemoryKv(), MEMORY_TOKEN: memoryToken };
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+
+  const missing = await liteWorker.fetch(new Request("https://example.invalid/mcp", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+  }), env);
+  assert.equal(missing.status, 401);
+
+  const bearer = await liteWorker.fetch(new Request("https://example.invalid/mcp", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${memoryToken}`, "Content-Type": "application/json" },
+    body,
+  }), env);
+  assert.equal(bearer.status, 200);
+
+  const urlOnly = await liteWorker.fetch(new Request(`https://example.invalid/mcp/${memoryToken}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+  }), env);
+  assert.equal(urlOnly.status, 200);
+
+  const landing = await liteWorker.fetch(new Request("https://example.invalid/"), env);
+  assert.equal(landing.status, 200);
+  assert.doesNotMatch(await landing.text(), new RegExp(memoryToken));
 });
 
 test("Vector profile indexes, searches, hides manifests, and deletes vectors", async () => {
