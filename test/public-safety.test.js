@@ -21,7 +21,7 @@ async function filesUnder(directory) {
   return result;
 }
 
-test("public workers accept no URL-carried token", async () => {
+test("public workers never accept query-parameter tokens or emit application logs", async () => {
   const paths = [
     path.join(root, "src", "worker.js"),
     path.join(root, "examples", "kv-only", "worker.js"),
@@ -29,31 +29,113 @@ test("public workers accept no URL-carried token", async () => {
   ];
   for (const sourcePath of paths) {
     const source = await readFile(sourcePath, "utf8");
-    assert.doesNotMatch(source, /pathname\.startsWith\(["']\/mcp\//);
     assert.doesNotMatch(source, /searchParams\.get\(["']token["']\)/i);
     assert.match(source, /request\.headers\.get\(["']Authorization["']\)/);
+    assert.doesNotMatch(source, /console\.(?:debug|error|info|log|warn)\s*\(/);
   }
 });
 
-test("runtime routing rejects path tokens and accepts only a sufficiently long header token", async () => {
+async function initialize(profile, path, env, headers = {}) {
+  return profile.fetch(new Request(`https://example.invalid${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...headers },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+  }), env);
+}
+
+test("all profiles preserve Bearer authentication on the exact /mcp route", async () => {
   const token = "x".repeat(32);
-  const env = { AUTH_TOKEN: token, ALLOWED_ORIGIN: "https://example.invalid" };
-  const pathResponse = await worker.fetch(new Request(`https://example.invalid/mcp/${token}`), env);
-  assert.equal(pathResponse.status, 404);
+  for (const profile of [worker, kvOnlyWorker, vectorSearchWorker]) {
+    const env = { AUTH_TOKEN: token, ALLOWED_ORIGIN: "https://example.invalid" };
+    const missingResponse = await initialize(profile, "/mcp", env);
+    assert.equal(missingResponse.status, 401);
+
+    const wrongResponse = await initialize(profile, "/mcp", env, { Authorization: `Bearer ${"y".repeat(32)}` });
+    assert.equal(wrongResponse.status, 401);
+
+    const acceptedResponse = await initialize(profile, "/mcp", env, { Authorization: `Bearer ${token}` });
+    assert.equal(acceptedResponse.status, 200);
+    assert.doesNotMatch(await acceptedResponse.text(), new RegExp(token));
+  }
 
   const shortTokenResponse = await worker.fetch(new Request("https://example.invalid/mcp", {
     headers: { Authorization: "Bearer short" },
   }), { AUTH_TOKEN: "short" });
   assert.equal(shortTokenResponse.status, 401);
+});
 
-  const initializeResponse = await worker.fetch(new Request("https://example.invalid/mcp", {
+test("all profiles accept only the exact configured secret URL", async () => {
+  const urlToken = "u".repeat(43);
+  const invalidConfiguredToken = `${"u".repeat(42)}/`;
+  const rejectedPaths = [
+    "/mcp/",
+    `/mcp/${"w".repeat(43)}`,
+    `/mcp/${urlToken}/extra`,
+    `/mcp/${urlToken}%2Fextra`,
+  ];
+
+  for (const profile of [worker, kvOnlyWorker, vectorSearchWorker]) {
+    const env = { MCP_URL_TOKEN: urlToken, ALLOWED_ORIGIN: "https://example.invalid" };
+    const acceptedResponse = await initialize(profile, `/mcp/${urlToken}`, env);
+    assert.equal(acceptedResponse.status, 200);
+    assert.doesNotMatch(await acceptedResponse.text(), new RegExp(urlToken));
+
+    for (const pathName of rejectedPaths) {
+      const response = await initialize(profile, pathName, env);
+      assert.equal(response.status, 404);
+      assert.doesNotMatch(await response.text(), new RegExp(urlToken));
+    }
+
+    const unconfiguredResponse = await initialize(profile, `/mcp/${urlToken}`, {
+      ALLOWED_ORIGIN: "https://example.invalid",
+    });
+    assert.equal(unconfiguredResponse.status, 404);
+
+    const invalidSecretResponse = await initialize(profile, `/mcp/${invalidConfiguredToken}`, {
+      MCP_URL_TOKEN: invalidConfiguredToken,
+      ALLOWED_ORIGIN: "https://example.invalid",
+    });
+    assert.equal(invalidSecretResponse.status, 404);
+
+    const shortSecretResponse = await initialize(profile, `/mcp/${"s".repeat(42)}`, {
+      MCP_URL_TOKEN: "s".repeat(42),
+      ALLOWED_ORIGIN: "https://example.invalid",
+    });
+    assert.equal(shortSecretResponse.status, 404);
+
+    const queryOnlyResponse = await initialize(profile, `/mcp?token=${urlToken}`, env);
+    assert.equal(queryOnlyResponse.status, 401);
+  }
+});
+
+test("ordinary Bearer and secret URL tokens cannot authenticate administrator routes", async () => {
+  const urlToken = "u".repeat(43);
+  const bearerToken = "b".repeat(32);
+  const env = {
+    AUTH_TOKEN: bearerToken,
+    MCP_URL_TOKEN: urlToken,
+    ADMIN_TOKEN: "a".repeat(32),
+  };
+  for (const ordinaryToken of [urlToken, bearerToken]) {
+    const response = await worker.fetch(new Request("https://example.invalid/admin/keys", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${ordinaryToken}`,
+        "Content-Type": "application/json",
+      },
+      body: "{}",
+    }), env);
+    assert.equal(response.status, 401);
+    assert.doesNotMatch(await response.text(), new RegExp(ordinaryToken));
+  }
+
+  const pathResponse = await worker.fetch(new Request(`https://example.invalid/admin/keys/${urlToken}`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
   }), env);
-  assert.equal(initializeResponse.status, 200);
-  const payload = await initializeResponse.json();
-  assert.equal(payload.result.serverInfo.version, "8.0.0-public.1");
+  assert.equal(pathResponse.status, 401);
+  assert.doesNotMatch(await pathResponse.text(), new RegExp(urlToken));
 });
 
 test("CORS preflight exposes no data and does not require a bearer token", async () => {
@@ -63,20 +145,6 @@ test("CORS preflight exposes no data and does not require a bearer token", async
   }), { ALLOWED_ORIGIN: "https://example.invalid" });
   assert.equal(response.status, 204);
   assert.equal(response.headers.get("Access-Control-Allow-Origin"), "https://example.invalid");
-});
-
-test("all three public profiles initialize with header authentication", async () => {
-  const token = "x".repeat(32);
-  for (const profile of [worker, kvOnlyWorker, vectorSearchWorker]) {
-    const response = await profile.fetch(new Request("https://example.invalid/mcp", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
-    }), { AUTH_TOKEN: token, ALLOWED_ORIGIN: "https://example.invalid" });
-    assert.equal(response.status, 200);
-    const payload = await response.json();
-    assert.equal(payload.error, undefined);
-  }
 });
 
 test("public workers have no unconditional all-memory tools", async () => {

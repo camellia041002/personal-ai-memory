@@ -10,3 +10,5 @@
 npx wrangler secret put AUTH_TOKEN --config wrangler.jsonc
 npx wrangler deploy --config wrangler.jsonc
 ```
+
+默认使用 `/mcp` + `Authorization: Bearer <AUTH_TOKEN>`。需要只粘贴一条 URL 时，可额外设置 `MCP_URL_TOKEN` Secret，并使用精确路径 `/mcp/<MCP_URL_TOKEN>`；生成方法、风险和严格路由规则见仓库根目录的 [README](../../README.md) 与 [SECURITY](../../SECURITY.md)。

@@ -6,7 +6,8 @@
 
 ```mermaid
 flowchart LR
-    C[MCP client] -->|Authorization Bearer AUTH_TOKEN| W[Cloudflare Worker]
+    C[MCP client] -->|/mcp plus Bearer AUTH_TOKEN| W[Cloudflare Worker]
+    U[URL-only MCP client] -->|exact /mcp/MCP_URL_TOKEN| W
     A[Admin operator] -->|Authorization Bearer ADMIN_TOKEN| W
     W -->|source text| K[(KV MEMORY)]
     W -->|chunks exact search index state| D[(D1 DB)]
@@ -16,6 +17,8 @@ flowchart LR
     V --> H
     H --> W
 ```
+
+普通 MCP 的两条入口只改变认证载体，不改变工具权限。`/mcp` 只使用 Bearer；可选的 `/mcp/<MCP_URL_TOKEN>` 只在 Secret 合法且路径完全匹配时启用。两者都不能进入 `/admin/*`。错误、未配置或多余层级的秘密 URL 统一视为不存在。
 
 ## Write path
 

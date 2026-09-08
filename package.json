@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "check:config": "node scripts/validate-config.mjs wrangler.example.jsonc examples/kv-only/wrangler.example.jsonc examples/vector-search/wrangler.example.jsonc",
-    "check": "npm run test && npm run check:config",
-    "seed:sample": "node scripts/seed-sample.mjs"
+    "check:config": "node scripts/validate-config.mjs --deploy",
+    "check:config:templates": "node scripts/validate-config.mjs --template wrangler.example.jsonc examples/kv-only/wrangler.example.jsonc examples/vector-search/wrangler.example.jsonc",
+    "check": "npm run test && npm run check:config:templates",
+    "seed:sample": "node scripts/seed-sample.mjs",
+    "smoke": "node scripts/smoke.mjs"
   },
   "engines": {
     "node": ">=20"

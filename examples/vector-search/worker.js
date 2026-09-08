@@ -3,14 +3,20 @@ const INDEX_VERSION = "vector-search-qwen3-embedding-0.6b";
 const EMBEDDING_MODEL = "@cf/qwen/qwen3-embedding-0.6b";
 const MANIFEST_PREFIX = "__vector_manifest__:";
 const LIMITS = Object.freeze({ key: 200, value: 100_000, query: 500, results: 5 });
-const MIN_TOKEN_LENGTH = 24;
+const MIN_BEARER_TOKEN_LENGTH = 24;
+const MIN_URL_TOKEN_LENGTH = 43;
+const URL_TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (url.pathname !== "/mcp") return new Response("Not Found", { status: 404 });
+    const bearerEndpoint = url.pathname === "/mcp";
+    const secretUrlEndpoint = isAuthorizedUrlPath(url.pathname, env.MCP_URL_TOKEN);
+    if (!bearerEndpoint && !secretUrlEndpoint) return new Response("Not Found", { status: 404 });
     if (request.method === "OPTIONS") return corsResponse(env);
-    if (!isAuthorized(request, env.AUTH_TOKEN)) return new Response("Unauthorized", { status: 401 });
+    if (bearerEndpoint && !isAuthorized(request, env.AUTH_TOKEN)) {
+      return new Response("Unauthorized", { status: 401 });
+    }
     if (request.method === "GET") return sseInit(env);
     if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
     let body;
@@ -276,8 +282,15 @@ function clampInt(value, fallback, min, max) {
 
 function isAuthorized(request, token) {
   return typeof token === "string"
-    && token.length >= MIN_TOKEN_LENGTH
+    && token.length >= MIN_BEARER_TOKEN_LENGTH
     && request.headers.get("Authorization") === `Bearer ${token}`;
+}
+
+function isAuthorizedUrlPath(pathname, token) {
+  return typeof token === "string"
+    && token.length >= MIN_URL_TOKEN_LENGTH
+    && URL_TOKEN_PATTERN.test(token)
+    && pathname === `/mcp/${token}`;
 }
 
 function safeError(error) { return (error instanceof Error ? error.message : String(error)).slice(0, 500); }

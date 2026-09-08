@@ -1,5 +1,7 @@
 # Source audit report
 
+> 本报告记录首次公开发布时的审计结论。后续工作区在不恢复查询参数、全量读取或管理员权限混用的前提下，重新加入了可选的严格路径 Token；当前行为以 README、SECURITY 和 Unreleased changelog 为准。
+
 ## Scope and method
 
 审计对象为私人目录中保存的四个 DOCX 归档：一份包含 V1—V5，另外三份分别包含 V6、V7、V8。审计以只读方式提取正文、表格、页眉页脚、文档属性、外部关系、评论和嵌入部件，并对各版本代码逐段比较。原始文件未被修改，V1—V7 源码未复制到本仓库。
@@ -57,4 +59,4 @@
 
 ## Public-edition verification target
 
-公开目录必须满足：无私人 DOCX、无 V1—V7 原码、无路径/查询参数 Token、无全量读取工具、无无确认删除、无生产标识、无真实样例、无 `.env`/`.dev.vars`/真实 Wrangler 配置，并且 Git 历史仅包含审计后的公开文件。
+首次公开目录的目标是：无私人 DOCX、无 V1—V7 原码、无路径/查询参数 Token、无全量读取工具、无无确认删除、无生产标识、无真实样例、无 `.env`/`.dev.vars`/真实 Wrangler 配置，并且 Git 历史仅包含审计后的公开文件。后续可选路径 Token 的重新引入不改变私人数据、生产资源、普通/管理员权限分离和禁止 query Token 的边界。

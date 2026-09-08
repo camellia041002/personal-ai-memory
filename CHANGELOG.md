@@ -2,6 +2,13 @@
 
 本记录来自私人归档中保存的 V1—V8 源码与随附说明。V1—V7 的完整原始源码不进入公开仓库；日期仅在归档或项目背景能够证明时列出。
 
+## Unreleased
+
+- 在保留 `/mcp` + Bearer 默认模式的同时，为三种公开 Worker 增加可选 `/mcp/<MCP_URL_TOKEN>` 便捷模式。
+- `MCP_URL_TOKEN` 只从 Cloudflare Secret 读取；未配置、格式无效、路径错误或多余层级均返回 `404`，且不能访问 `/admin/*`。
+- 将配置检查拆分为“模板结构有效”和“实际配置可部署”，实际模式拒绝占位符、空 ID 和明显无效的资源标识。
+- 重排 README 的首次部署流程，增加客户端连接说明、跨平台 Token 生成、metadata index 确认、示例导入和部署后 smoke test。
+
 ## V8 — 2026-09-04
 
 ### Added
@@ -33,7 +40,7 @@
 
 以下变化只存在于本公开版，用于脱敏和安全发布，不反向修改生产 Worker：
 
-- 移除 `/mcp/<token>` 路径 Token 兼容，只保留 `Authorization: Bearer`。
+- 当时移除 `/mcp/<token>` 路径 Token 兼容，只保留 `Authorization: Bearer`；后续公开版在更严格的 Secret、路径和权限约束下重新加入可选便捷模式，见 Unreleased。
 - 将个人化 owner 和人物前缀改为通用 owner 规则与 `person_` 前缀。
 - 同时识别 `project_` 和 `proj_`，修复归档 V8 只识别后者的问题。
 - 增加 key、value、query、owner、note 和管理分页长度或数量上限。

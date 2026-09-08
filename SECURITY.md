@@ -2,13 +2,22 @@
 
 ## Supported authentication
 
-MCP 端点只接受 `Authorization: Bearer <AUTH_TOKEN>`。管理员端点只接受独立的 `Authorization: Bearer <ADMIN_TOKEN>`。两个 Token 必须不同、随机生成并至少 24 个字符；生产部署建议使用更长的高熵值。
+普通 MCP 提供两种连接方式：
 
-不要把 Token 放入 URL。URL 会进入浏览历史、代理记录、访问日志、监控系统和截图。公开版明确拒绝旧归档曾支持的 `/mcp/<token>` 路径，也不实现查询参数 Token。
+- 默认安全模式：精确路径 `/mcp` 只接受 `Authorization: Bearer <AUTH_TOKEN>`；
+- 可选便捷模式：精确路径 `/mcp/<MCP_URL_TOKEN>`，仅在配置了有效 `MCP_URL_TOKEN` Secret 时启用。
+
+管理员端点 `/admin/*` 始终只接受独立的 `Authorization: Bearer <ADMIN_TOKEN>`。`AUTH_TOKEN`、`MCP_URL_TOKEN` 都不能访问管理员接口。三个 Token 必须分别生成且互不相同；`AUTH_TOKEN` 与 `ADMIN_TOKEN` 至少 24 个字符，文档提供的默认做法是为每个 Token 分别生成 32 字节安全随机数。
+
+`MCP_URL_TOKEN` 必须来自至少 32 字节的安全随机数，并编码为单个 URL-safe 路径段。运行时要求至少 43 个字符，且只允许 ASCII 字母、数字、`-` 和 `_`；43 字符 base64url 或 64 字符十六进制值都符合路径格式。`/mcp/`、错误 Token、未配置 Token、额外路径层级和非 URL-safe Token 都返回 `404`。`/mcp` 缺少或使用错误 Bearer 时返回 `401`。
+
+本项目不支持 query parameter Token。仅把 `?token=...` 附加到 `/mcp` 不会通过鉴权。
+
+完整秘密 URL 等同于密码，而且风险高于请求头：它可能进入 Cloudflare 平台或代理的请求日志、客户端配置、浏览历史、监控系统、错误报告、截图、剪贴板和复制记录。应用代码不会主动记录请求 URL 或 Token，也不会在响应和错误信息中回显它们，但无法阻止 Cloudflare 平台、上游代理或客户端自身记录完整路径。能配置请求头时，应优先使用 Bearer 模式。
 
 ## Secret storage
 
-凭据必须通过 Cloudflare Secrets 配置，例如 `wrangler secret put AUTH_TOKEN`。不得把 Token 写入 `wrangler.jsonc`、源码、示例数据、CI 文件、Issue、日志或备份。本仓库的 `wrangler.example.jsonc` 只包含资源 ID 占位符和非敏感示例值。
+凭据必须通过 Cloudflare Secrets 配置，例如 `wrangler secret put AUTH_TOKEN`、`wrangler secret put ADMIN_TOKEN` 和可选的 `wrangler secret put MCP_URL_TOKEN`。不得把 Token 写入 `wrangler.jsonc`、源码、示例数据、CI 文件、Issue、应用日志或备份。本仓库的 `wrangler.example.jsonc` 只包含资源 ID 占位符和非敏感示例值。
 
 ## Data isolation
 
@@ -18,7 +27,7 @@ MCP 端点只接受 `Authorization: Bearer <AUTH_TOKEN>`。管理员端点只接
 
 ## Permission separation
 
-普通 MCP 权限可以保存、读取、受限查找、检索和确认删除单个 key。它不能无条件列出全部 key，也不能全量读取全部内容。
+普通 MCP 权限可以通过 Bearer 或秘密 URL 认证，权限相同：保存、读取、受限查找、检索和确认删除单个 key。它不能无条件列出全部 key，也不能全量读取全部内容。
 
 管理员权限可以分页查看 key、查看索引状态并逐 key 重建。管理员 Token 的泄露影响范围更大，不应配置到普通 MCP 客户端。删除仍位于普通工具集中，是为了保持 V8 的使用方式，但必须提供与目标 key 完全一致的 `confirmKey`。
 
