@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+- 将项目定位改为不绑定单一 AI 的外置 MCP 记忆系统：一个 AI 可独立使用，多个客户端可选共用，并说明 key 前缀是分类而不是权限隔离。
+- 新增独立 `v8` Deploy to Cloudflare 包，声明自动创建 KV、D1、Vectorize、Workers AI，部署时执行 D1 migration 并请求建立三项 metadata indexes。
+- 新 V8 部署使用同一个 `MEMORY_TOKEN` 支持 Bearer 与单 URL，管理员接口继续使用独立的 `ADMIN_TOKEN`；旧 `AUTH_TOKEN` / `MCP_URL_TOKEN` 配置保持兼容。
+- README 增加基于 Cloudflare 当前 1 GB KV 免费存储的条数估算，并列明每日请求、读取、写入和列表额度。
 - 新增首页默认 Lite：独立的 `lite` 一键部署目录、自动 KV provisioning、单一普通权限 `MEMORY_TOKEN` 和 `workers.dev` 落地页。
 - README 改为 Lite 优先的四步流程，明确无需本机 Git、Node 或域名，但 Cloudflare 部署按钮会连接使用者的 GitHub/GitLab 并在其账号创建代码副本。
 - 增加 Lite 与索引版 AI 部署提示词、Cloudflare 资源、最小权限、交付清单和秘密禁区文档。

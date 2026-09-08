@@ -8,7 +8,9 @@
 
 Lite 的 Worker 与 KV 位于部署者自己的 Cloudflare 账号中，但 Cloudflare 仍承载服务和数据；调用工具时，AI 客户端及模型也会看到所请求和返回的记忆。本项目不提供端到端加密、客户端侧加密、OAuth、多租户隔离、审计日志或内置速率限制。
 
-以下章节中的 `AUTH_TOKEN`、`MCP_URL_TOKEN` 和 `ADMIN_TOKEN` 适用于索引版与 Hybrid V8。
+Lite 和新的 `v8` 一键部署包都使用一个 `MEMORY_TOKEN` 作为普通记忆钥匙：它既可放在 Bearer header，也可用于只支持单 URL 的客户端。V8 另有独立的 `ADMIN_TOKEN`，只能用于索引维护接口，必须与 `MEMORY_TOKEN` 不同。
+
+以下章节中的 `AUTH_TOKEN`、`MCP_URL_TOKEN` 和 `ADMIN_TOKEN` 继续适用于索引版和旧的 Hybrid V8 手工配置；公开 V8 代码保留这些旧变量作为向后兼容。
 
 ## Supported authentication
 
@@ -27,7 +29,7 @@ Lite 的 Worker 与 KV 位于部署者自己的 Cloudflare 账号中，但 Cloud
 
 ## Secret storage
 
-凭据必须通过 Cloudflare Secrets 配置，例如 `wrangler secret put AUTH_TOKEN`、`wrangler secret put ADMIN_TOKEN` 和可选的 `wrangler secret put MCP_URL_TOKEN`。不得把 Token 写入 `wrangler.jsonc`、源码、示例数据、CI 文件、Issue、应用日志或备份。本仓库的 `wrangler.example.jsonc` 只包含资源 ID 占位符和非敏感示例值。
+凭据必须通过 Cloudflare Secrets 配置。新部署使用 `MEMORY_TOKEN` 和 V8 的 `ADMIN_TOKEN`；旧手工配置可继续使用 `AUTH_TOKEN`、`ADMIN_TOKEN` 和可选的 `MCP_URL_TOKEN`。不得把 Token 写入 `wrangler.jsonc`、源码、示例数据、CI 文件、Issue、应用日志或备份。本仓库的配置模板只包含资源声明、占位符和非敏感示例值。
 
 ## Data isolation
 

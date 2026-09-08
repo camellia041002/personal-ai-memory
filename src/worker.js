@@ -14,7 +14,7 @@ import {
   vectorIdFor,
 } from "./core.js";
 
-const SERVER_VERSION = "8.0.0-public.1";
+const SERVER_VERSION = "8.0.0-public.2";
 const EMBEDDING_MODEL = "@cf/qwen/qwen3-embedding-0.6b";
 const FINAL_TOP_K = 5;
 const VECTOR_CANDIDATES = 40;
@@ -27,12 +27,13 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    if (url.pathname === "/") return landingPage();
     if (url.pathname.startsWith("/admin/")) return handleAdmin(request, env, url);
     const bearerEndpoint = url.pathname === "/mcp";
-    const secretUrlEndpoint = isAuthorizedUrlPath(url.pathname, env.MCP_URL_TOKEN);
+    const secretUrlEndpoint = isAuthorizedUrlPath(url.pathname, urlToken(env));
     if (!bearerEndpoint && !secretUrlEndpoint) return new Response("Not Found", { status: 404 });
     if (request.method === "OPTIONS") return corsResponse(env);
-    if (bearerEndpoint && !isAuthorized(request, env.AUTH_TOKEN)) {
+    if (bearerEndpoint && !isAuthorized(request, memoryToken(env))) {
       return new Response("Unauthorized", { status: 401 });
     }
     if (request.method === "GET") return sseInit(env);
@@ -546,6 +547,25 @@ function isAuthorizedUrlPath(pathname, token) {
     && token.length >= MIN_URL_TOKEN_LENGTH
     && URL_TOKEN_PATTERN.test(token)
     && pathname === `/mcp/${token}`;
+}
+
+function memoryToken(env) {
+  return env.MEMORY_TOKEN || env.AUTH_TOKEN;
+}
+
+function urlToken(env) {
+  return env.MEMORY_TOKEN || env.MCP_URL_TOKEN;
+}
+
+function landingPage() {
+  return new Response([
+    "personal-ai-memory V8 is running.",
+    "",
+    "MCP endpoint: /mcp (Bearer) or /mcp/<MEMORY_TOKEN> (URL-only clients).",
+    "Keep MEMORY_TOKEN and ADMIN_TOKEN secret. This page never displays them.",
+  ].join("\n"), {
+    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
+  });
 }
 
 function safeError(error) {

@@ -40,6 +40,30 @@ test("Lite one-click config requests automatic KV provisioning", async () => {
   assert.doesNotThrow(() => validateConfig(config, { mode: "provision" }));
 });
 
+test("V8 deploy-button config requests isolated automatic resources", async () => {
+  const raw = await readFile(path.join(root, "v8", "wrangler.jsonc"), "utf8");
+  const config = JSON.parse(stripJsonComments(raw));
+  assert.deepEqual(config.kv_namespaces, [{ binding: "MEMORY" }]);
+  assert.deepEqual(config.d1_databases, [{ binding: "DB", database_name: "personal-ai-memory-v8-db" }]);
+  assert.deepEqual(config.vectorize, [{ binding: "VECTORIZE_INDEX", index_name: "personal-ai-memory-v8-index" }]);
+  assert.deepEqual(config.ai, { binding: "AI" });
+  assert.doesNotThrow(() => validateConfig(config, { mode: "provision" }));
+});
+
+test("V8 deploy package applies schema and all required metadata indexes", async () => {
+  const packageJson = JSON.parse(await readFile(path.join(root, "v8", "package.json"), "utf8"));
+  assert.match(packageJson.scripts.deploy, /db:migrate/);
+  assert.match(packageJson.scripts.deploy, /vectorize:metadata/);
+  assert.match(packageJson.scripts.deploy, /wrangler deploy/);
+
+  const setup = await readFile(path.join(root, "v8", "scripts", "setup-vectorize.mjs"), "utf8");
+  for (const property of ["cat", "owner", "date"]) assert.match(setup, new RegExp(`"${property}"`));
+
+  const rootMigration = await readFile(path.join(root, "migrations", "0001_schema.sql"), "utf8");
+  const deployMigration = await readFile(path.join(root, "v8", "migrations", "0001_schema.sql"), "utf8");
+  assert.equal(deployMigration, rootMigration);
+});
+
 test("a fully replaced Hybrid V8 config is deployable", () => {
   assert.doesNotThrow(() => validateConfig(validHybridConfig(), { mode: "deploy" }));
 });

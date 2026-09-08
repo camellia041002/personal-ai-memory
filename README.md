@@ -1,8 +1,8 @@
 # personal-ai-memory
 
-**给不同的 AI 接上一块由你自己控制的长期记忆。**
+**给你的 AI 接上一块由你自己控制的外置长期记忆。**
 
-它不是新的 AI，也不会自动偷看你的聊天。只有当你明确让 AI 保存或读取时，它才会处理那条记忆。
+它是一个通过 MCP 连接的外置记忆系统。只用一个 AI 就可以使用；以后如果换客户端或同时使用多个 AI，也可以让它们连接同一份记忆。它不绑定某个 AI，只有客户端调用保存、读取或搜索工具时，相关内容才会进入这个系统。
 
 基础版部署在**你自己的 Cloudflare 账号**中：不用买服务器，不用买域名，也不用在电脑上安装开发工具。准备一个 GitHub 账号和一个 Cloudflare 账号，跟着下面四步即可。
 
@@ -62,7 +62,10 @@ https://你的项目名.你的子域名.workers.dev/mcp/你的MEMORY_TOKEN
 - 用完整名称读取记忆；
 - 按名称或前缀查找少量记忆；
 - 在再次确认名称后删除记忆；
-- 让多个支持远程 MCP 的 AI 客户端连接同一份记忆。
+- 给一个支持远程 MCP 的 AI 增加长期记忆；
+- 需要时，让多个 AI 客户端连接同一份记忆。
+
+如果多个 AI 共用，可以用 key 前缀整理来源或用途，例如 `shared_`、`chatgpt_`、`claude_`。前缀只是分类，不是权限隔离：连接同一地址和钥匙的客户端，原则上都能访问这份记忆。需要真正隔离时，应分别部署记忆库或使用不同的访问控制。
 
 ## 它不是什么
 
@@ -72,7 +75,16 @@ https://你的项目名.你的子域名.workers.dev/mcp/你的MEMORY_TOKEN
 - 没有多人账号、审计日志或端到端加密；
 - 基础版不会按“意思相近”搜索正文。
 
-第一次使用先确认“保存和读取”是否真的对你有用。需要更强搜索和恢复能力时，再看[进阶版本](docs/ADVANCED.md)。
+第一次使用先确认“保存和读取”是否真的对你有用。
+
+## Lite 和完整 V8
+
+| 版本 | 适合谁 | 部署 |
+| --- | --- | --- |
+| Lite | 第一次使用；按完整 key 或前缀查找 | 使用上面的默认按钮 |
+| V8 | 需要按意思搜索、日期记录、混合检索和索引恢复 | [打开 V8 部署说明](v8/README.md) |
+
+V8 现在有独立的 Deploy to Cloudflare 按钮，代码入口就是 [`v8`](v8)。受 Cloudflare 当前部署页限制，它还需要额外填写 Vectorize 的 `1024` 和 `cosine` 两个固定值；本地配置和 dry-run 可以验证，但在完成一次全新资源端到端测试前，不把它标成“已验证的一键部署”。详细区别见[进阶版本](docs/ADVANCED.md)。
 
 ## 数据在哪里
 
@@ -82,7 +94,11 @@ https://你的项目名.你的子域名.workers.dev/mcp/你的MEMORY_TOKEN
 
 ## 费用
 
-Cloudflare 免费套餐包含一定的服务请求、读写和存储额度，日常个人使用通常够用；它不是“永久无限免费”的承诺。超过当期免费额度时，操作可能失败或需要升级套餐。以 [Cloudflare 当前定价](https://developers.cloudflare.com/workers/platform/pricing/) 为准。
+按 Cloudflare 当前免费额度，Lite 使用的 KV 在一个账号中共有 **1 GB** 存储，每天包含 **100,000 次读取、1,000 次写入和 1,000 次列表请求**；Worker 本身每天包含 **100,000 次请求**。日常个人记忆通常够用，但不是“永久无限免费”的承诺。
+
+粗略换算：如果每条记忆连同 key 平均约 2 KB，1 GB 大约能放 50 万条；平均约 10 KB，大约能放 10 万条。实际数量会受 UTF-8 编码、key、元数据和同账号其他 KV 数据影响，所以这只是量级估算，不是容量保证。
+
+额度会调整，请以 Cloudflare 的 [KV 限制](https://developers.cloudflare.com/kv/platform/limits/)、[KV 定价](https://developers.cloudflare.com/kv/platform/pricing/)和 [Workers 定价](https://developers.cloudflare.com/workers/platform/pricing/)为准。V8 还会使用语义索引和模型额度，具体见[进阶版本](docs/ADVANCED.md)。
 
 ## 想让 AI 帮你部署
 

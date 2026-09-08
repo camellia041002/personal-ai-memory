@@ -6,11 +6,11 @@
 | --- | --- | --- |
 | Lite | Worker、KV binding `MEMORY` | `MEMORY_TOKEN` |
 | 索引版 | Worker、KV `MEMORY`、Vectorize `VECTORIZE_INDEX`、Workers AI `AI` | `AUTH_TOKEN`；可选 `MCP_URL_TOKEN` |
-| Hybrid V8 | 索引版全部资源、D1 `DB`、三项 Vectorize metadata indexes | `AUTH_TOKEN`、`ADMIN_TOKEN`；可选 `MCP_URL_TOKEN` |
+| Hybrid V8 | 索引版全部资源、D1 `DB`、三项 Vectorize metadata indexes | 新部署使用 `MEMORY_TOKEN`、`ADMIN_TOKEN`；旧配置继续兼容 `AUTH_TOKEN` 和 `MCP_URL_TOKEN` |
 
 Lite 的 Deploy to Cloudflare 按钮会读取 `lite/wrangler.jsonc`，在使用者自己的 Cloudflare 账号中自动创建并绑定 KV。部署页会根据 `lite/.dev.vars.example` 收集 `MEMORY_TOKEN`。按钮路线不需要把 Cloudflare API Token 交给 AI。
 
-索引版与 Hybrid V8 目前保留为 AI/CLI 辅助部署路线，尚未在全新账号上把它们标记为“一键已验证”。
+Hybrid V8 的 `v8` 子目录现已提供 Deploy to Cloudflare 配置：自动声明 KV、D1、Vectorize 和 Workers AI，部署脚本执行 migration 并补齐 `cat`、`owner`、`date` metadata indexes。Cloudflare 当前无法从 Wrangler 配置预填 Vectorize 维度和 metric，因此部署页必须手填 `1024` 与 `cosine`。该入口尚未用全新资源端到端验证，不能标记为“一键已验证”。索引版仍保留为 AI/CLI 辅助部署路线。
 
 ## CLI/API 自动化的最小权限
 

@@ -1,0 +1,18 @@
+{
+  "name": "personal-ai-memory-v8",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-04",
+  "workers_dev": true,
+  "kv_namespaces": [
+    { "binding": "MEMORY" }
+  ],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "personal-ai-memory-v8-db" }
+  ],
+  "vectorize": [
+    { "binding": "VECTORIZE_INDEX", "index_name": "personal-ai-memory-v8-index" }
+  ],
+  "ai": {
+    "binding": "AI"
+  }
+}

@@ -94,7 +94,9 @@ export function validateConfig(config, options = {}) {
   for (const item of config.d1_databases || []) {
     validateRequiredString(item?.binding, "D1 binding", mode, RESOURCE_NAME_PATTERN);
     validateRequiredString(item?.database_name, `D1 database name for ${item?.binding || "unknown binding"}`, mode, RESOURCE_NAME_PATTERN);
-    validateRequiredString(item?.database_id, `D1 database ID for ${item?.binding || "unknown binding"}`, mode, D1_ID_PATTERN);
+    if (!(mode === "provision" && item?.database_id === undefined)) {
+      validateRequiredString(item?.database_id, `D1 database ID for ${item?.binding || "unknown binding"}`, mode, D1_ID_PATTERN);
+    }
   }
   for (const item of config.vectorize || []) {
     validateRequiredString(item?.binding, "Vectorize binding", mode, RESOURCE_NAME_PATTERN);

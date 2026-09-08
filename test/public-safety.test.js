@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import worker from "../src/worker.js";
 import kvOnlyWorker from "../examples/kv-only/worker.js";
 import liteWorker from "../lite/worker.js";
+import v8DeployWorker from "../v8/worker.js";
 import vectorSearchWorker from "../examples/vector-search/worker.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -27,6 +28,7 @@ test("public workers never accept query-parameter tokens or emit application log
     path.join(root, "src", "worker.js"),
     path.join(root, "examples", "kv-only", "worker.js"),
     path.join(root, "lite", "worker.js"),
+    path.join(root, "v8", "worker.js"),
     path.join(root, "examples", "vector-search", "worker.js"),
   ];
   for (const sourcePath of paths) {
@@ -68,6 +70,13 @@ test("all profiles preserve Bearer authentication on the exact /mcp route", asyn
   });
   assert.equal(liteAccepted.status, 200);
   assert.doesNotMatch(await liteAccepted.text(), new RegExp(liteToken));
+
+  const v8Token = "v".repeat(43);
+  const v8Accepted = await initialize(v8DeployWorker, "/mcp", { MEMORY_TOKEN: v8Token }, {
+    Authorization: `Bearer ${v8Token}`,
+  });
+  assert.equal(v8Accepted.status, 200);
+  assert.doesNotMatch(await v8Accepted.text(), new RegExp(v8Token));
 
   const shortTokenResponse = await worker.fetch(new Request("https://example.invalid/mcp", {
     headers: { Authorization: "Bearer short" },
@@ -117,6 +126,13 @@ test("all profiles accept only the exact configured secret URL", async () => {
     const queryOnlyResponse = await initialize(profile, `/mcp?token=${urlToken}`, env);
     assert.equal(queryOnlyResponse.status, 401);
   }
+
+  const v8MemoryToken = "m".repeat(43);
+  const v8UrlResponse = await initialize(v8DeployWorker, `/mcp/${v8MemoryToken}`, {
+    MEMORY_TOKEN: v8MemoryToken,
+  });
+  assert.equal(v8UrlResponse.status, 200);
+  assert.doesNotMatch(await v8UrlResponse.text(), new RegExp(v8MemoryToken));
 });
 
 test("ordinary Bearer and secret URL tokens cannot authenticate administrator routes", async () => {
@@ -163,6 +179,7 @@ test("public workers have no unconditional all-memory tools", async () => {
     path.join(root, "src", "worker.js"),
     path.join(root, "examples", "kv-only", "worker.js"),
     path.join(root, "lite", "worker.js"),
+    path.join(root, "v8", "worker.js"),
     path.join(root, "examples", "vector-search", "worker.js"),
   ];
   for (const sourcePath of paths) {

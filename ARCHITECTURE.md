@@ -31,7 +31,7 @@ flowchart LR
     H --> W
 ```
 
-普通 MCP 的两条入口只改变认证载体，不改变工具权限。`/mcp` 只使用 Bearer；可选的 `/mcp/<MCP_URL_TOKEN>` 只在 Secret 合法且路径完全匹配时启用。两者都不能进入 `/admin/*`。错误、未配置或多余层级的秘密 URL 统一视为不存在。
+普通 MCP 的两条入口只改变认证载体，不改变工具权限。新的 V8 一键部署以同一个 `MEMORY_TOKEN` 支持 `/mcp` Bearer 和 `/mcp/<MEMORY_TOKEN>`；旧手工配置仍兼容分别使用 `AUTH_TOKEN` 与 `MCP_URL_TOKEN`。普通 Token 都不能进入 `/admin/*`，管理员接口始终要求独立的 `ADMIN_TOKEN`。错误、未配置或多余层级的秘密 URL 统一视为不存在。
 
 ## Write path
 

@@ -1,0 +1,27 @@
+{
+  "name": "personal-ai-memory-v8",
+  "version": "8.0.0-public.2",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "npm run db:migrate && npm run vectorize:metadata && wrangler deploy",
+    "db:migrate": "wrangler d1 migrations apply DB --remote",
+    "vectorize:metadata": "node scripts/setup-vectorize.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "4.130.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "MEMORY_TOKEN": {
+        "description": "普通记忆钥匙。请生成至少 43 位的随机字母数字串；它同时用于 Bearer 和单 URL 连接。"
+      },
+      "ADMIN_TOKEN": {
+        "description": "管理员恢复钥匙。请另行生成随机串，必须与 MEMORY_TOKEN 不同，只用于索引维护。"
+      },
+      "VECTORIZE_INDEX": {
+        "description": "部署页请选择 Dimensions = 1024、Metric = cosine；这两项必须与 V8 使用的嵌入模型匹配。"
+      }
+    }
+  }
+}
