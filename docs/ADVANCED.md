@@ -14,5 +14,6 @@
 - [索引版 / Hybrid V8 的 AI 部署提示词](AI_DEPLOY_INDEXED.md)
 - [Cloudflare 资源、最小权限、交付和秘密禁区](CLOUDFLARE_DEPLOYMENT.md)
 - [架构说明](../ARCHITECTURE.md)
+- [从 V1 到 V8：工具与设计演进](EVOLUTION.md)
 - [版本演进](../CHANGELOG.md)
 - [公开安全审计](../AUDIT_REPORT.md)
