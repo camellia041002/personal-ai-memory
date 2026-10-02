@@ -2,6 +2,9 @@
 
 V8 是带混合搜索和索引恢复能力的完整版本。它仍是一个部署在你自己 Cloudflare 账号里的外置 MCP 记忆系统；一个 AI 可以使用，也可以让多个支持远程 MCP 的客户端连接同一份记忆。
 
+> [!WARNING]
+> **已经在用 Lite 的朋友，不要直接点击下面的 V8 部署按钮。** 按钮会新建一个空的 KV，因此刚部署好的 V8 暂时看不到旧记忆。原来的记忆没有丢，只是新 Worker 的 `MEMORY` 还没有接到原来的 KV。请先阅读[《从 Lite 升级到 V8》](../README.md#从-lite-升级到-v8)：部署后把 `MEMORY` 绑定回原来的 KV，再为旧记忆补建索引。
+
 [![Deploy V8 to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/camellia041002/personal-ai-memory/tree/main/v8)
 
 部署页会自动准备 Worker、KV、D1、Vectorize 和 Workers AI。你需要完成三项输入：
