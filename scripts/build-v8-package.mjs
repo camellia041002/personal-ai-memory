@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,4 +16,10 @@ const output = [
 
 await mkdir(path.join(root, "v8"), { recursive: true });
 await writeFile(path.join(root, "v8", "worker.js"), output, "utf8");
+await mkdir(path.join(root, "v8", "migrations"), { recursive: true });
+for (const file of await readdir(path.join(root, "migrations"))) {
+  if (file.endsWith(".sql")) {
+    await copyFile(path.join(root, "migrations", file), path.join(root, "v8", "migrations", file));
+  }
+}
 console.log("v8/worker.js generated from public src");

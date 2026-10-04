@@ -3,6 +3,10 @@
   "main": "worker.js",
   "compatibility_date": "2026-09-04",
   "workers_dev": true,
+  "vars": {
+    "V9_AUTH_MODE": "off",
+    "V9_RECALL_ENABLED": "false"
+  },
   "kv_namespaces": [
     { "binding": "MEMORY" }
   ],

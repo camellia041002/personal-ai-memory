@@ -34,7 +34,7 @@ const existing = propertyNames(JSON.parse(run([
   "vectorize", "list-metadata-index", indexName, "--json",
 ])));
 
-for (const property of ["cat", "owner", "date"]) {
+for (const property of ["cat", "owner", "date", "space"]) {
   if (existing.has(property)) continue;
   run([
     "vectorize", "create-metadata-index", indexName,

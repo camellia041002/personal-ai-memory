@@ -3,6 +3,7 @@ import {
   LIMITS,
   clampInt,
   classifyKey,
+  fragmentIdFor,
   isIsoDate,
   normalizeDailyNote,
   normalizeOwner,
@@ -22,6 +23,22 @@ const MAX_RESULTS_PER_KEY = 2;
 const MIN_BEARER_TOKEN_LENGTH = 24;
 const MIN_URL_TOKEN_LENGTH = 43;
 const URL_TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/;
+const V9_MODE_SHADOW = "shadow";
+const V9_RECALL_FLAG = "true";
+const LEGACY_SPACE_ID = "space-legacy-unclassified";
+const RESERVED_SPACE_KEYS = new Set(["shared", "admin", "legacy-unclassified"]);
+const CAPABILITIES = new Set(["read", "recall", "write", "delete"]);
+const TOOL_CAPABILITIES = Object.freeze({
+  save_memory: "write",
+  save_daily: "write",
+  get_memory: "read",
+  find_memory_keys: "read",
+  get_recent_dailies: "read",
+  search_memories: "recall",
+  recall_memory: "recall",
+  report_recall_feedback: "recall",
+  delete_memory: "delete",
+});
 
 export default {
   async fetch(request, env) {
@@ -33,9 +50,10 @@ export default {
     const secretUrlEndpoint = isAuthorizedUrlPath(url.pathname, urlToken(env));
     if (!bearerEndpoint && !secretUrlEndpoint) return new Response("Not Found", { status: 404 });
     if (request.method === "OPTIONS") return corsResponse(env);
-    if (bearerEndpoint && !isAuthorized(request, memoryToken(env))) {
-      return new Response("Unauthorized", { status: 401 });
-    }
+    const auth = secretUrlEndpoint
+      ? legacyAuthContext("legacy-url")
+      : await authenticateMcpRequest(request, env);
+    if (!auth) return new Response("Unauthorized", { status: 401 });
     if (request.method === "GET") return sseInit(env);
     if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
 
@@ -55,9 +73,12 @@ export default {
           serverInfo: { name: "personal-ai-memory", version: SERVER_VERSION },
         }), 200, env);
       }
-      if (method === "tools/list") return jsonResponse(rpcResult(id, { tools: TOOLS }), 200, env);
+      if (method === "tools/list") {
+        return jsonResponse(rpcResult(id, { tools: visibleTools(auth, env) }), 200, env);
+      }
       if (method === "tools/call") {
-        const result = await callTool(params?.name, params?.arguments ?? {}, env);
+        assertToolAuthorized(auth, params?.name, env);
+        const result = await callTool(params?.name, params?.arguments ?? {}, env, auth);
         const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
         return jsonResponse(rpcResult(id, { content: [{ type: "text", text }] }), 200, env);
       }
@@ -79,6 +100,39 @@ const TOOLS = [
         value: { type: "string", maxLength: LIMITS.value },
       },
       required: ["key", "value"],
+    },
+  },
+  {
+    name: "recall_memory",
+    description: "Use when the current reply may depend on prior personal context, project state, preferences, people, or past decisions that are not already clear in the conversation. Do not call for ordinary small talk or every turn. Returns up to two complete V8 chunks from granted spaces; the model decides whether either candidate is relevant enough to mention.",
+    v9Only: true,
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", maxLength: LIMITS.query },
+        category: { type: "string", maxLength: 40 },
+        owner: { type: "string", maxLength: LIMITS.owner },
+        dateFrom: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+        dateTo: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+        limit: { type: "integer", minimum: 1, maximum: 2 },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "report_recall_feedback",
+    description: "Record reported feedback for a recall event returned to this same client. Feedback does not change ranking or source memory.",
+    v9Only: true,
+    inputSchema: {
+      type: "object",
+      properties: {
+        eventId: { type: "string", maxLength: 80 },
+        signal: { type: "string", enum: ["presented", "engaged", "helpful", "dismissed", "wrong"] },
+        evidence: { type: "string", enum: ["model_reported", "user_explicit"] },
+      },
+      required: ["eventId", "signal", "evidence"],
+      additionalProperties: false,
     },
   },
   {
@@ -160,46 +214,95 @@ const TOOLS = [
   },
 ];
 
-async function callTool(name, args, env) {
+async function callTool(name, args, env, auth) {
   switch (name) {
-    case "save_memory": return saveMemory(args, env);
-    case "save_daily": return saveDaily(args, env);
-    case "get_memory": return getMemory(args, env);
-    case "find_memory_keys": return findMemoryKeys(args, env);
-    case "get_recent_dailies": return getRecentDailies(args, env);
-    case "search_memories": return searchMemories(args, env);
-    case "delete_memory": return deleteMemory(args, env);
+    case "save_memory": return saveMemory(args, env, auth);
+    case "save_daily": return saveDaily(args, env, auth);
+    case "get_memory": return getMemory(args, env, auth);
+    case "find_memory_keys": return findMemoryKeys(args, env, auth);
+    case "get_recent_dailies": return getRecentDailies(args, env, auth);
+    case "search_memories": return searchMemories(args, env, auth);
+    case "recall_memory": return recallMemory(args, env, auth);
+    case "report_recall_feedback": return reportRecallFeedback(args, env, auth);
+    case "delete_memory": return deleteMemory(args, env, auth);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
 
-async function saveMemory({ key, value }, env) {
+async function saveMemory(args, env, auth) {
+  const { key, value } = args;
   validateKeyValue(key, value);
-  await env.MEMORY.put(key, value);
+  const lockId = authMode(env) === V9_MODE_SHADOW
+    ? await acquireKeyMutationLock(env.DB, key)
+    : null;
   try {
-    const indexResult = await indexMemory(key, value, env);
-    return { key, kv: "ok", ...indexResult };
-  } catch (error) {
-    await markIndexPending(env.DB, key, classifyKey(key), safeError(error));
-    return { key, kv: "ok", index: "pending", error: safeError(error) };
+    let spaceId = await indexSpaceForRequest(auth, key, env);
+    if (!auth.legacy) {
+      const targetSpace = await requireSpaceGrant(auth, args.spaceKey, "write", env);
+      const existingValue = await env.MEMORY.get(key);
+      const existingMapping = await readKeySpace(env.DB, key);
+      const currentSpaceId = existingMapping?.space_id || (existingValue === null ? null : LEGACY_SPACE_ID);
+      if (currentSpaceId && currentSpaceId !== targetSpace.spaceId) {
+        throw new Error("an existing key cannot be moved by save; use the administrator mapping endpoint");
+      }
+      if (existingValue !== null) assertSpaceCapability(auth, currentSpaceId, "write");
+      if (!existingMapping) {
+        const inserted = await insertKeySpace(
+          env.DB,
+          key,
+          targetSpace.spaceId,
+          existingValue === null ? "explicit" : "fallback",
+        );
+        if (!inserted) {
+          const authoritative = await readKeySpace(env.DB, key);
+          if (authoritative?.space_id !== targetSpace.spaceId) {
+            throw new Error("an existing key cannot be moved by save; use the administrator mapping endpoint");
+          }
+        }
+      }
+      spaceId = targetSpace.spaceId;
+    }
+    await env.MEMORY.put(key, value);
+    try {
+      const indexResult = await indexMemory(key, value, env, spaceId);
+      return { key, kv: "ok", ...indexResult };
+    } catch (error) {
+      await markIndexPending(env.DB, key, classifyKey(key), safeError(error), spaceId);
+      return { key, kv: "ok", index: "pending", error: safeError(error) };
+    }
+  } finally {
+    if (lockId) await releaseKeyMutationLock(env.DB, key, lockId);
   }
 }
 
-async function saveDaily({ owner, date, value, note, overwrite = false }, env) {
+async function saveDaily(args, env, auth) {
+  const { owner, date, value, note, overwrite = false } = args;
   const safeOwner = normalizeOwner(owner);
   if (!isIsoDate(date)) throw new Error("date must be YYYY-MM-DD");
   validateKeyValue(`${safeOwner}_daily_${date}`, value);
   const prefix = `${safeOwner}_daily_${date}`;
   const existing = await listAllKeys(env.MEMORY, { prefix });
-  const conflicts = existing.filter((key) => key === prefix || key.startsWith(`${prefix}_`));
+  let conflicts = existing.filter((key) => key === prefix || key.startsWith(`${prefix}_`));
+  if (!auth.legacy && conflicts.length) {
+    const targetSpace = await requireSpaceGrant(auth, args.spaceKey, "write", env);
+    const mappings = await readKeySpacesForKeys(env.DB, conflicts);
+    conflicts = conflicts.filter((candidate) => (
+      mappings.get(candidate) || LEGACY_SPACE_ID
+    ) === targetSpace.spaceId);
+  }
   if (conflicts.length && !overwrite) throw new Error("an entry already exists for this owner and date");
 
   const cleanNote = normalizeDailyNote(note);
   const key = cleanNote ? `${prefix}_${cleanNote}` : prefix;
-  const result = await saveMemory({ key, value }, env);
+  if (!auth.legacy && overwrite) {
+    for (const oldKey of conflicts) {
+      if (oldKey !== key) await requireKeyCapability(auth, oldKey, "delete", env);
+    }
+  }
+  const result = await saveMemory({ key, value, spaceKey: args.spaceKey }, env, auth);
   if (overwrite && result.index === "ok") {
     for (const oldKey of conflicts) {
-      if (oldKey !== key) await removeMemoryEverywhere(oldKey, env, true);
+      if (oldKey !== key) await deleteMemory({ key: oldKey, confirmKey: oldKey }, env, auth);
     }
   }
   return {
@@ -208,13 +311,14 @@ async function saveDaily({ owner, date, value, note, overwrite = false }, env) {
   };
 }
 
-async function getMemory({ key }, env) {
+async function getMemory({ key }, env, auth) {
   validateKeyValue(key, "");
+  if (!auth.legacy) await requireKeyCapability(auth, key, "read", env);
   const value = await env.MEMORY.get(key);
   return value === null ? `Not found: ${key}` : value;
 }
 
-async function findMemoryKeys(args, env) {
+async function findMemoryKeys(args, env, auth) {
   const { query, prefix, category, owner, scope = "active" } = args;
   if (!["active", "cold"].includes(scope)) throw new Error("scope must be active or cold");
   if (![query, prefix, category, owner].some((value) => typeof value === "string" && value.trim())) {
@@ -225,7 +329,7 @@ async function findMemoryKeys(args, env) {
   const limit = clampInt(args.limit, 10, 1, LIMITS.findKeys);
   const keys = await listAllKeys(env.MEMORY, { prefix: prefix?.trim() || undefined });
   const needle = query?.trim().toLocaleLowerCase("zh-CN");
-  const results = [];
+  const candidates = [];
   for (const key of keys) {
     const meta = classifyKey(key);
     if (scope === "active" && !meta.index) continue;
@@ -233,23 +337,42 @@ async function findMemoryKeys(args, env) {
     if (needle && !key.toLocaleLowerCase("zh-CN").includes(needle)) continue;
     if (category && meta.category !== category) continue;
     if (owner && meta.owner !== owner) continue;
-    results.push({ key, category: meta.category, owner: meta.owner, date: meta.date });
-    if (results.length >= limit) break;
+    candidates.push({ key, category: meta.category, owner: meta.owner, date: meta.date });
   }
+  const results = auth.legacy
+    ? candidates.slice(0, limit)
+    : await selectAuthorizedKeyItems(candidates, limit, auth, env.DB, "read");
   return { count: results.length, results };
 }
 
-async function getRecentDailies(args, env) {
+async function selectAuthorizedKeyItems(items, limit, auth, db, capability) {
+  const selected = [];
+  const batchSize = 80;
+  for (let offset = 0; offset < items.length && selected.length < limit; offset += batchSize) {
+    const batch = items.slice(offset, offset + batchSize);
+    const mappings = await readKeySpacesForKeys(db, batch.map(({ key }) => key));
+    for (const item of batch) {
+      const spaceId = mappings.get(item.key) || LEGACY_SPACE_ID;
+      if (!(auth.grants || []).some((grant) => grant.space_id === spaceId && grant.capability === capability)) continue;
+      selected.push(item);
+      if (selected.length >= limit) break;
+    }
+  }
+  return selected;
+}
+
+async function getRecentDailies(args, env, auth) {
   const owner = args.owner || "all";
   if (owner !== "all") normalizeOwner(owner);
   const days = clampInt(args.days, 3, 1, LIMITS.recentDays);
   const keys = await listAllKeys(env.MEMORY);
-  const matches = keys
-    .map((key) => ({ key, meta: classifyKey(key) }))
+  const matches = keys.map((key) => ({ key, meta: classifyKey(key) }))
     .filter(({ meta }) => meta.category === "daily" && (owner === "all" || meta.owner === owner))
     .sort((left, right) => right.meta.date.localeCompare(left.meta.date) || left.key.localeCompare(right.key));
-  const selectedDates = [...new Set(matches.map(({ meta }) => meta.date))].slice(0, days);
-  const selected = matches.filter(({ meta }) => selectedDates.includes(meta.date));
+  const selected = auth.legacy
+    ? selectRecentDailyItems(matches, days)
+    : await selectAuthorizedRecentDailyItems(matches, days, auth, env.DB);
+  const selectedDates = [...new Set(selected.map(({ meta }) => meta.date))];
   const results = await Promise.all(selected.map(async ({ key, meta }) => ({
     key,
     owner: meta.owner,
@@ -260,30 +383,187 @@ async function getRecentDailies(args, env) {
   return { days: selectedDates.length, count: results.length, results };
 }
 
-async function searchMemories(args, env) {
+function selectRecentDailyItems(items, days) {
+  const selectedDates = [...new Set(items.map(({ meta }) => meta.date))].slice(0, days);
+  return items.filter(({ meta }) => selectedDates.includes(meta.date));
+}
+
+async function selectAuthorizedRecentDailyItems(items, days, auth, db) {
+  const selected = [];
+  const selectedDates = new Set();
+  const batchSize = 80;
+  for (let offset = 0; offset < items.length; offset += batchSize) {
+    const batch = items.slice(offset, offset + batchSize);
+    const mappings = await readKeySpacesForKeys(db, batch.map(({ key }) => key));
+    for (const item of batch) {
+      if (!selectedDates.has(item.meta.date) && selectedDates.size >= days) return selected;
+      const spaceId = mappings.get(item.key) || LEGACY_SPACE_ID;
+      if (!(auth.grants || []).some((grant) => grant.space_id === spaceId && grant.capability === "read")) continue;
+      selectedDates.add(item.meta.date);
+      selected.push(item);
+    }
+  }
+  return selected;
+}
+
+async function readKeySpacesForKeys(db, keys) {
+  if (!keys.length) return new Map();
+  const placeholders = keys.map(() => "?").join(",");
+  const result = await db.prepare(
+    `SELECT memory_key, space_id FROM memory_key_spaces
+     WHERE memory_key IN (${placeholders})`,
+  ).bind(...keys).all();
+  return new Map((result.results || []).map((row) => [row.memory_key, row.space_id]));
+}
+
+async function searchMemories(args, env, auth) {
+  const spaceIds = auth.legacy ? null : grantedSpaceIds(auth, "recall");
+  const result = await hybridSearch(args, env, { spaceIds, tolerant: false });
+  return {
+    query: result.query,
+    count: result.results.length,
+    results: result.results.map(publicSearchItem),
+  };
+}
+
+async function recallMemory(args, env, auth) {
+  if (auth.legacy) throw new Error("recall_memory requires an isolated client token");
+  const spaceIds = grantedSpaceIds(auth, "recall");
+  const limit = clampInt(args.limit, 2, 1, 2);
+  const result = await hybridSearch(args, env, { spaceIds, tolerant: true });
+  const selected = result.results.slice(0, limit);
+  const candidates = selected.map((item) => ({
+    eventId: crypto.randomUUID(),
+    fragmentId: null,
+    key: item.key,
+    chunkIndex: item.chunkIndex,
+    category: item.category,
+    owner: item.owner,
+    date: item.date,
+    chunk: item.chunk,
+    score: item.score,
+    semanticScore: item.semanticScore,
+    exactMatch: item.exactMatch,
+  }));
+  let tracking = "ok";
+  if (candidates.length) {
+    const statements = [];
+    for (let index = 0; index < candidates.length; index += 1) {
+      const item = selected[index];
+      const candidate = candidates[index];
+      candidate.fragmentId = await fragmentIdFor(item.key, item.chunkIndex, item.contentHash, item.indexVersion);
+      statements.push(env.DB.prepare(
+        `INSERT INTO recall_events
+         (event_id, client_id, space_id, fragment_id, memory_key, chunk_index, content_hash, index_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        candidate.eventId,
+        auth.clientId,
+        item.spaceId,
+        candidate.fragmentId,
+        item.key,
+        item.chunkIndex,
+        item.contentHash,
+        item.indexVersion,
+      ));
+    }
+    try {
+      await env.DB.batch(statements);
+    } catch {
+      tracking = "degraded";
+      for (const candidate of candidates) candidate.eventId = null;
+    }
+  }
+  const outcome = candidates.length
+    ? "match"
+    : result.retrieval.status === "ok" ? "no_indexed_match"
+      : result.retrieval.status === "partial" ? "inconclusive" : "error";
+  return {
+    query: result.query,
+    outcome,
+    count: candidates.length,
+    candidates,
+    tracking,
+    retrieval: result.retrieval,
+  };
+}
+
+async function reportRecallFeedback(args, env, auth) {
+  if (auth.legacy) throw new Error("feedback requires an isolated client token");
+  const eventId = String(args.eventId || "").trim();
+  const signal = String(args.signal || "");
+  const evidence = String(args.evidence || "");
+  if (!eventId || eventId.length > 80) throw new Error("eventId is required");
+  if (!new Set(["presented", "engaged", "helpful", "dismissed", "wrong"]).has(signal)) {
+    throw new Error("unsupported feedback signal");
+  }
+  if (!new Set(["model_reported", "user_explicit"]).has(evidence)) {
+    throw new Error("unsupported feedback evidence");
+  }
+  const event = await env.DB.prepare(
+    `SELECT event_id, client_id, space_id, memory_key, chunk_index, content_hash, index_version
+     FROM recall_events WHERE event_id = ? AND client_id = ?`,
+  ).bind(eventId, auth.clientId).first();
+  if (!event) throw new Error("recall event was not returned to this client");
+  assertSpaceCapability(auth, event.space_id, "recall");
+  const inserted = await env.DB.prepare(
+    `INSERT INTO recall_feedback (event_id, signal, evidence)
+     VALUES (?, ?, ?)
+     ON CONFLICT(event_id, signal, evidence) DO NOTHING`,
+  ).bind(eventId, signal, evidence).run();
+  const current = await env.DB.prepare(
+    `SELECT content_hash, index_version FROM memory_chunks
+     WHERE memory_key = ? AND chunk_index = ? LIMIT 1`,
+  ).bind(event.memory_key, event.chunk_index).first();
+  const stale = !current
+    || current.content_hash !== event.content_hash
+    || current.index_version !== event.index_version;
+  return {
+    eventId,
+    signal,
+    evidence,
+    created: Number(inserted.meta?.changes || 0) > 0,
+    stale,
+    rankingChanged: false,
+  };
+}
+
+async function hybridSearch(args, env, { spaceIds = null, tolerant = false } = {}) {
   const query = normalizeQuery(args.query);
   const filters = normalizeSearchFilters(args);
-  const [exactRows, vectors] = await Promise.all([
-    exactSearch(env.DB, query, filters, 30),
-    getEmbeddings([buildQueryText(query)], env),
-  ]);
-
-  const vectorOptions = { topK: VECTOR_CANDIDATES, returnMetadata: "all" };
-  const vectorFilter = buildVectorFilter(filters);
-  if (Object.keys(vectorFilter).length) vectorOptions.filter = vectorFilter;
-  const vectorResult = await env.VECTORIZE_INDEX.query(vectors[0], vectorOptions);
-  const matches = vectorResult.matches || [];
-  const validRows = await loadIndexedChunksByIds(env.DB, matches.map((match) => match.id));
+  const exactPromise = spaceIds
+    ? exactSearchForSpaces(env.DB, query, filters, 30, spaceIds)
+    : exactSearch(env.DB, query, filters, 30);
+  const semanticPromise = semanticSearch(env, query, filters, spaceIds);
+  let exactRows;
+  let semantic;
+  let retrieval = { status: "ok", exact: "ok", semantic: "ok" };
+  if (!tolerant) {
+    [exactRows, semantic] = await Promise.all([exactPromise, semanticPromise]);
+  } else {
+    const [exactAttempt, semanticAttempt] = await Promise.allSettled([exactPromise, semanticPromise]);
+    exactRows = exactAttempt.status === "fulfilled" ? exactAttempt.value : [];
+    semantic = semanticAttempt.status === "fulfilled" ? semanticAttempt.value : { matches: [], rows: [] };
+    retrieval = {
+      status: exactAttempt.status === "fulfilled" && semanticAttempt.status === "fulfilled"
+        ? "ok"
+        : exactAttempt.status === "rejected" && semanticAttempt.status === "rejected" ? "error" : "partial",
+      exact: exactAttempt.status === "fulfilled" ? "ok" : "error",
+      semantic: semanticAttempt.status === "fulfilled" ? "ok" : "error",
+    };
+  }
+  const matches = semantic.matches;
+  const validRows = semantic.rows;
   const matchById = new Map(matches.map((match) => [match.id, match]));
 
   const candidates = new Map();
   for (const row of validRows) {
     const match = matchById.get(row.vector_id);
-    if (match) candidates.set(row.vector_id, scoreCandidate(row, query, Number(match.score) || 0, false));
+    if (match) candidates.set(row.vector_id, internalCandidate(row, query, Number(match.score) || 0, false));
   }
   for (const row of exactRows) {
     const semanticScore = candidates.get(row.vector_id)?.semanticScore || 0;
-    candidates.set(row.vector_id, scoreCandidate(row, query, semanticScore, true));
+    candidates.set(row.vector_id, internalCandidate(row, query, semanticScore, true));
   }
 
   const perKey = new Map();
@@ -295,29 +575,37 @@ async function searchMemories(args, env) {
     results.push(item);
     if (results.length >= FINAL_TOP_K) break;
   }
-  return { query, count: results.length, results };
+  return { query, results, retrieval };
 }
 
-async function deleteMemory({ key, confirmKey }, env) {
+async function deleteMemory({ key, confirmKey }, env, auth) {
   validateKeyValue(key, "");
   if (confirmKey !== key) throw new Error("confirmKey must exactly match key");
-  await removeMemoryEverywhere(key, env, true);
-  return { key, deleted: true };
+  const lockId = authMode(env) === V9_MODE_SHADOW
+    ? await acquireKeyMutationLock(env.DB, key)
+    : null;
+  try {
+    if (!auth.legacy) await requireKeyCapability(auth, key, "delete", env);
+    await removeMemoryEverywhere(key, env, true, shouldMaintainMappings(auth, env));
+    return { key, deleted: true };
+  } finally {
+    if (lockId) await releaseKeyMutationLock(env.DB, key, lockId);
+  }
 }
 
-async function indexMemory(key, value, env) {
+async function indexMemory(key, value, env, spaceId = null) {
   const meta = classifyKey(key);
   const contentHash = await sha256Hex(value);
   if (!meta.index) {
     await purgeIndexForKey(key, env);
-    await writeIndexState(env.DB, key, meta, contentHash, [], "skipped", null);
+    await writeIndexState(env.DB, key, meta, contentHash, [], "skipped", null, spaceId);
     return { index: "skipped", reason: meta.category, chunks: 0 };
   }
 
   const chunks = splitText(value);
   if (!chunks.length) {
     await purgeIndexForKey(key, env);
-    await writeIndexState(env.DB, key, meta, contentHash, [], "skipped", "empty_content");
+    await writeIndexState(env.DB, key, meta, contentHash, [], "skipped", "empty_content", spaceId);
     return { index: "skipped", reason: "empty_content", chunks: 0 };
   }
 
@@ -335,11 +623,12 @@ async function indexMemory(key, value, env) {
       date: meta.date || "",
       ver: INDEX_VERSION,
       preview: chunk.slice(0, 500),
+      ...(spaceId ? { space: spaceId } : {}),
     },
   }));
   await env.VECTORIZE_INDEX.upsert(vectors);
   const oldIds = await readVectorIds(env.DB, key);
-  await replaceD1Chunks(env.DB, key, meta, contentHash, ids, chunks);
+  await replaceD1Chunks(env.DB, key, meta, contentHash, ids, chunks, spaceId);
   const staleIds = oldIds.filter((id) => !ids.includes(id));
   if (staleIds.length) await env.VECTORIZE_INDEX.deleteByIds(staleIds);
   return { index: "ok", chunks: chunks.length, model: EMBEDDING_MODEL, contentHash };
@@ -355,6 +644,10 @@ async function handleAdmin(request, env, url) {
     return jsonResponse({ error: "Invalid JSON" }, 400, env);
   }
   try {
+    if (url.pathname.startsWith("/admin/v9/")) {
+      if (authMode(env) !== V9_MODE_SHADOW) throw new Error("V9 administration is disabled");
+      return jsonResponse(await handleV9Admin(url.pathname, body, env), 200, env);
+    }
     if (url.pathname === "/admin/keys") {
       const limit = clampInt(body.limit, 100, 1, LIMITS.adminPage);
       const prefix = typeof body.prefix === "string" && body.prefix ? body.prefix : undefined;
@@ -368,9 +661,19 @@ async function handleAdmin(request, env, url) {
     if (url.pathname === "/admin/reindex-key") {
       const key = String(body.key || "");
       validateKeyValue(key, "");
-      const value = await env.MEMORY.get(key);
-      if (value === null) throw new Error("key does not exist in KV");
-      return jsonResponse({ key, ...(await indexMemory(key, value, env)) }, 200, env);
+      const lockId = authMode(env) === V9_MODE_SHADOW
+        ? await acquireKeyMutationLock(env.DB, key)
+        : null;
+      try {
+        const value = await env.MEMORY.get(key);
+        if (value === null) throw new Error("key does not exist in KV");
+        const spaceId = authMode(env) === V9_MODE_SHADOW
+          ? (await readKeySpace(env.DB, key))?.space_id || LEGACY_SPACE_ID
+          : null;
+        return jsonResponse({ key, ...(await indexMemory(key, value, env, spaceId)) }, 200, env);
+      } finally {
+        if (lockId) await releaseKeyMutationLock(env.DB, key, lockId);
+      }
     }
     if (url.pathname === "/admin/index-status") {
       const result = await env.DB.prepare(
@@ -384,6 +687,218 @@ async function handleAdmin(request, env, url) {
   }
 }
 
+async function handleV9Admin(pathname, body, env) {
+  if (pathname === "/admin/v9/clients/create") {
+    requireBooleanConfirmation(body.confirmCreate, "confirmCreate");
+    const clientName = normalizeLabel(body.clientName, "clientName");
+    const expiresAt = normalizeOptionalTimestamp(body.expiresAt, "expiresAt");
+    const token = randomToken();
+    const clientId = crypto.randomUUID();
+    await env.DB.prepare(
+      "INSERT INTO api_clients (client_id, client_name, token_hash, expires_at) VALUES (?, ?, ?, ?)",
+    ).bind(clientId, clientName, await sha256Hex(token), expiresAt).run();
+    return { clientId, clientName, expiresAt, token, tokenShownOnce: true };
+  }
+  if (pathname === "/admin/v9/clients/list") {
+    const rows = await env.DB.prepare(
+      "SELECT client_id, client_name, created_at, expires_at, revoked_at FROM api_clients ORDER BY created_at, client_id",
+    ).all();
+    return { clients: rows.results || [] };
+  }
+  if (pathname === "/admin/v9/clients/revoke") {
+    const clientId = normalizeClientId(body.clientId);
+    requireConfirmation(body.confirmClientId, clientId, "confirmClientId");
+    const result = await env.DB.prepare(
+      "UPDATE api_clients SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP) WHERE client_id = ?",
+    ).bind(clientId).run();
+    return { clientId, revoked: Number(result.meta?.changes || 0) > 0 };
+  }
+  if (pathname === "/admin/v9/spaces/create") {
+    const spaceKey = normalizeSpaceKey(body.spaceKey);
+    requireConfirmation(body.confirmSpaceKey, spaceKey, "confirmSpaceKey");
+    if (RESERVED_SPACE_KEYS.has(spaceKey)) throw new Error("reserved spaces are created by the migration");
+    const spaceType = String(body.spaceType || "custom");
+    if (!new Set(["private", "custom"]).has(spaceType)) throw new Error("spaceType must be private or custom");
+    const displayName = normalizeLabel(body.displayName, "displayName");
+    const spaceId = crypto.randomUUID();
+    await env.DB.prepare(
+      "INSERT INTO memory_spaces (space_id, space_key, space_type, display_name) VALUES (?, ?, ?, ?)",
+    ).bind(spaceId, spaceKey, spaceType, displayName).run();
+    return { spaceId, spaceKey, spaceType, displayName };
+  }
+  if (pathname === "/admin/v9/spaces/list") {
+    const rows = await env.DB.prepare(
+      "SELECT space_id, space_key, space_type, display_name, created_at, disabled_at FROM memory_spaces ORDER BY space_key",
+    ).all();
+    return { spaces: rows.results || [] };
+  }
+  if (pathname === "/admin/v9/spaces/disable") {
+    const spaceKey = normalizeSpaceKey(body.spaceKey);
+    if (RESERVED_SPACE_KEYS.has(spaceKey)) throw new Error("reserved spaces cannot be disabled");
+    requireConfirmation(body.confirmSpaceKey, spaceKey, "confirmSpaceKey");
+    const result = await env.DB.prepare(
+      "UPDATE memory_spaces SET disabled_at = COALESCE(disabled_at, CURRENT_TIMESTAMP) WHERE space_key = ?",
+    ).bind(spaceKey).run();
+    return { spaceKey, disabled: Number(result.meta?.changes || 0) > 0 };
+  }
+  if (pathname === "/admin/v9/grants/create") {
+    const clientId = normalizeClientId(body.clientId);
+    const spaceKey = normalizeSpaceKey(body.spaceKey);
+    const capability = normalizeCapability(body.capability);
+    requireConfirmation(body.confirmGrant, `${clientId}:${spaceKey}:${capability}`, "confirmGrant");
+    const expiresAt = normalizeOptionalTimestamp(body.expiresAt, "expiresAt");
+    const client = await env.DB.prepare(
+      "SELECT client_id FROM api_clients WHERE client_id = ? AND revoked_at IS NULL",
+    ).bind(clientId).first();
+    const space = await env.DB.prepare(
+      "SELECT space_id FROM memory_spaces WHERE space_key = ? AND disabled_at IS NULL",
+    ).bind(spaceKey).first();
+    if (!client) throw new Error("active client not found");
+    if (!space) throw new Error("active space not found");
+    await env.DB.prepare(
+      `INSERT INTO api_client_space_grants (client_id, space_id, capability, expires_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(client_id, space_id, capability) DO UPDATE SET
+         expires_at=excluded.expires_at, revoked_at=NULL, granted_at=CURRENT_TIMESTAMP`,
+    ).bind(clientId, space.space_id, capability, expiresAt).run();
+    return { clientId, spaceKey, capability, expiresAt };
+  }
+  if (pathname === "/admin/v9/grants/list") {
+    const clientId = body.clientId ? normalizeClientId(body.clientId) : null;
+    const where = clientId ? "WHERE g.client_id = ?" : "";
+    const statement = env.DB.prepare(
+      `SELECT g.client_id, s.space_key, g.capability, g.granted_at, g.expires_at, g.revoked_at
+       FROM api_client_space_grants g JOIN memory_spaces s ON s.space_id = g.space_id
+       ${where} ORDER BY g.client_id, s.space_key, g.capability`,
+    );
+    const rows = clientId ? await statement.bind(clientId).all() : await statement.all();
+    return { grants: rows.results || [] };
+  }
+  if (pathname === "/admin/v9/grants/revoke") {
+    const clientId = normalizeClientId(body.clientId);
+    const spaceKey = normalizeSpaceKey(body.spaceKey);
+    const capability = normalizeCapability(body.capability);
+    const confirmation = `${clientId}:${spaceKey}:${capability}`;
+    requireConfirmation(body.confirmGrant, confirmation, "confirmGrant");
+    const result = await env.DB.prepare(
+      `UPDATE api_client_space_grants SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP)
+       WHERE client_id = ? AND space_id = (SELECT space_id FROM memory_spaces WHERE space_key = ?)
+         AND capability = ?`,
+    ).bind(clientId, spaceKey, capability).run();
+    return { clientId, spaceKey, capability, revoked: Number(result.meta?.changes || 0) > 0 };
+  }
+  if (pathname === "/admin/v9/key-space/get") {
+    const key = String(body.key || "");
+    validateKeyValue(key, "");
+    const mapping = await readKeySpace(env.DB, key);
+    return {
+      key,
+      spaceKey: mapping?.space_key || "legacy-unclassified",
+      explicitMapping: Boolean(mapping),
+    };
+  }
+  if (pathname === "/admin/v9/key-space/assign") {
+    const key = String(body.key || "");
+    validateKeyValue(key, "");
+    requireConfirmation(body.confirmKey, key, "confirmKey");
+    const lockId = await acquireKeyMutationLock(env.DB, key);
+    try {
+      const value = await env.MEMORY.get(key);
+      const current = await readKeySpace(env.DB, key);
+      if (value === null && !current) throw new Error("key does not exist in KV or space mappings");
+      const targetKey = normalizeSpaceKey(body.spaceKey);
+      const target = await env.DB.prepare(
+        "SELECT space_id FROM memory_spaces WHERE space_key = ? AND disabled_at IS NULL",
+      ).bind(targetKey).first();
+      if (!target) throw new Error("active target space not found");
+      const currentKey = current?.space_key || "legacy-unclassified";
+      if (currentKey !== targetKey) requireConfirmation(body.confirmFromSpaceKey, currentKey, "confirmFromSpaceKey");
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO memory_key_spaces (memory_key, space_id, assignment_source)
+           VALUES (?, ?, 'explicit')
+           ON CONFLICT(memory_key) DO UPDATE SET
+             space_id=excluded.space_id, assignment_source=excluded.assignment_source,
+             updated_at=CURRENT_TIMESTAMP`,
+        ).bind(key, target.space_id),
+        env.DB.prepare("UPDATE memory_chunks SET space_id = ? WHERE memory_key = ?").bind(target.space_id, key),
+        env.DB.prepare("UPDATE memory_index_state SET space_id = ? WHERE memory_key = ?").bind(target.space_id, key),
+      ]);
+      return { key, fromSpaceKey: currentKey, spaceKey: targetKey, reindexRequired: currentKey !== targetKey };
+    } finally {
+      await releaseKeyMutationLock(env.DB, key, lockId);
+    }
+  }
+  if (pathname === "/admin/v9/key-space/dry-run-prefix") {
+    const prefix = String(body.prefix || "");
+    validateKeyValue(prefix, "");
+    const spaceKey = normalizeSpaceKey(body.spaceKey);
+    const space = await env.DB.prepare(
+      "SELECT space_id FROM memory_spaces WHERE space_key = ? AND disabled_at IS NULL",
+    ).bind(spaceKey).first();
+    if (!space) throw new Error("active target space not found");
+    const keys = await listAllKeys(env.MEMORY, { prefix });
+    let alreadyMapped = 0;
+    for (let offset = 0; offset < keys.length; offset += 80) {
+      const mappings = await readKeySpacesForKeys(env.DB, keys.slice(offset, offset + 80));
+      for (const mappedSpaceId of mappings.values()) {
+        if (mappedSpaceId === space.space_id) alreadyMapped += 1;
+      }
+    }
+    return {
+      prefix,
+      targetSpaceKey: spaceKey,
+      count: keys.length,
+      alreadyMapped,
+      unmappedOrDifferent: keys.length - alreadyMapped,
+      materialized: false,
+    };
+  }
+  throw new Error("unknown V9 admin operation");
+}
+
+function normalizeLabel(value, field) {
+  const normalized = String(value || "").trim();
+  if (!normalized || normalized.length > 80 || /[\u0000-\u001f\u007f]/u.test(normalized)) {
+    throw new Error(`${field} must be 1-80 printable characters`);
+  }
+  return normalized;
+}
+
+function normalizeClientId(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(normalized)) {
+    throw new Error("clientId must be a UUID");
+  }
+  return normalized;
+}
+
+function normalizeCapability(value) {
+  const capability = String(value || "");
+  if (!CAPABILITIES.has(capability)) throw new Error("unsupported capability");
+  return capability;
+}
+
+function normalizeOptionalTimestamp(value, field) {
+  if (value === undefined || value === null || value === "") return null;
+  const date = new Date(String(value));
+  if (Number.isNaN(date.valueOf())) throw new Error(`${field} must be an ISO timestamp`);
+  return date.toISOString();
+}
+
+function requireConfirmation(actual, expected, field) {
+  if (actual !== expected) throw new Error(`${field} must exactly match ${expected}`);
+}
+
+function requireBooleanConfirmation(actual, field) {
+  if (actual !== true) throw new Error(`${field} must be true`);
+}
+
+function randomToken() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 async function purgeIndexForKey(key, env) {
   const ids = await readVectorIds(env.DB, key);
   if (ids.length) await env.VECTORIZE_INDEX.deleteByIds(ids);
@@ -393,55 +908,92 @@ async function purgeIndexForKey(key, env) {
   ]);
 }
 
-async function removeMemoryEverywhere(key, env, deleteKv) {
+async function removeMemoryEverywhere(key, env, deleteKv, deleteMapping = false) {
   await purgeIndexForKey(key, env);
   if (deleteKv) await env.MEMORY.delete(key);
+  if (deleteMapping) await env.DB.prepare("DELETE FROM memory_key_spaces WHERE memory_key = ?").bind(key).run();
 }
 
-async function replaceD1Chunks(db, key, meta, contentHash, ids, chunks) {
+async function replaceD1Chunks(db, key, meta, contentHash, ids, chunks, spaceId = null) {
   const statements = [db.prepare("DELETE FROM memory_chunks WHERE memory_key = ?").bind(key)];
   for (let index = 0; index < chunks.length; index += 1) {
-    statements.push(db.prepare(
-      `INSERT INTO memory_chunks
-       (vector_id, memory_key, chunk_index, chunk_text, category, owner, memory_date, content_hash, index_version)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(ids[index], key, index, chunks[index], meta.category, meta.owner, meta.date, contentHash, INDEX_VERSION));
+    if (spaceId) {
+      statements.push(db.prepare(
+        `INSERT INTO memory_chunks
+         (vector_id, memory_key, chunk_index, chunk_text, category, owner, memory_date, content_hash, index_version, space_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(ids[index], key, index, chunks[index], meta.category, meta.owner, meta.date, contentHash, INDEX_VERSION, spaceId));
+    } else {
+      statements.push(db.prepare(
+        `INSERT INTO memory_chunks
+         (vector_id, memory_key, chunk_index, chunk_text, category, owner, memory_date, content_hash, index_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(ids[index], key, index, chunks[index], meta.category, meta.owner, meta.date, contentHash, INDEX_VERSION));
+    }
   }
-  statements.push(db.prepare(
-    `INSERT INTO memory_index_state
-     (memory_key, category, owner, memory_date, content_hash, vector_ids_json, chunk_count, index_version, status, error, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL, CURRENT_TIMESTAMP)
-     ON CONFLICT(memory_key) DO UPDATE SET
-       category=excluded.category, owner=excluded.owner, memory_date=excluded.memory_date,
-       content_hash=excluded.content_hash, vector_ids_json=excluded.vector_ids_json,
-       chunk_count=excluded.chunk_count, index_version=excluded.index_version,
-       status='ok', error=NULL, updated_at=CURRENT_TIMESTAMP`,
-  ).bind(key, meta.category, meta.owner, meta.date, contentHash, JSON.stringify(ids), ids.length, INDEX_VERSION));
+  const stateSql = spaceId
+    ? `INSERT INTO memory_index_state
+       (memory_key, category, owner, memory_date, content_hash, vector_ids_json, chunk_count, index_version, status, error, updated_at, space_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL, CURRENT_TIMESTAMP, ?)
+       ON CONFLICT(memory_key) DO UPDATE SET
+         category=excluded.category, owner=excluded.owner, memory_date=excluded.memory_date,
+         content_hash=excluded.content_hash, vector_ids_json=excluded.vector_ids_json,
+         chunk_count=excluded.chunk_count, index_version=excluded.index_version,
+         status='ok', error=NULL, updated_at=CURRENT_TIMESTAMP, space_id=excluded.space_id`
+    : `INSERT INTO memory_index_state
+       (memory_key, category, owner, memory_date, content_hash, vector_ids_json, chunk_count, index_version, status, error, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL, CURRENT_TIMESTAMP)
+       ON CONFLICT(memory_key) DO UPDATE SET
+         category=excluded.category, owner=excluded.owner, memory_date=excluded.memory_date,
+         content_hash=excluded.content_hash, vector_ids_json=excluded.vector_ids_json,
+         chunk_count=excluded.chunk_count, index_version=excluded.index_version,
+         status='ok', error=NULL, updated_at=CURRENT_TIMESTAMP`;
+  const stateBinds = [key, meta.category, meta.owner, meta.date, contentHash, JSON.stringify(ids), ids.length, INDEX_VERSION];
+  if (spaceId) stateBinds.push(spaceId);
+  statements.push(db.prepare(stateSql).bind(...stateBinds));
   await db.batch(statements);
 }
 
-async function writeIndexState(db, key, meta, contentHash, ids, status, error) {
-  await db.prepare(
-    `INSERT INTO memory_index_state
-     (memory_key, category, owner, memory_date, content_hash, vector_ids_json, chunk_count, index_version, status, error, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-     ON CONFLICT(memory_key) DO UPDATE SET
-       category=excluded.category, owner=excluded.owner, memory_date=excluded.memory_date,
-       content_hash=excluded.content_hash, vector_ids_json=excluded.vector_ids_json,
-       chunk_count=excluded.chunk_count, index_version=excluded.index_version,
-       status=excluded.status, error=excluded.error, updated_at=CURRENT_TIMESTAMP`,
-  ).bind(key, meta.category, meta.owner, meta.date, contentHash, JSON.stringify(ids), ids.length, INDEX_VERSION, status, error).run();
+async function writeIndexState(db, key, meta, contentHash, ids, status, error, spaceId = null) {
+  const sql = spaceId
+    ? `INSERT INTO memory_index_state
+       (memory_key, category, owner, memory_date, content_hash, vector_ids_json, chunk_count, index_version, status, error, updated_at, space_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+       ON CONFLICT(memory_key) DO UPDATE SET
+         category=excluded.category, owner=excluded.owner, memory_date=excluded.memory_date,
+         content_hash=excluded.content_hash, vector_ids_json=excluded.vector_ids_json,
+         chunk_count=excluded.chunk_count, index_version=excluded.index_version,
+         status=excluded.status, error=excluded.error, updated_at=CURRENT_TIMESTAMP, space_id=excluded.space_id`
+    : `INSERT INTO memory_index_state
+       (memory_key, category, owner, memory_date, content_hash, vector_ids_json, chunk_count, index_version, status, error, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(memory_key) DO UPDATE SET
+         category=excluded.category, owner=excluded.owner, memory_date=excluded.memory_date,
+         content_hash=excluded.content_hash, vector_ids_json=excluded.vector_ids_json,
+         chunk_count=excluded.chunk_count, index_version=excluded.index_version,
+         status=excluded.status, error=excluded.error, updated_at=CURRENT_TIMESTAMP`;
+  const binds = [key, meta.category, meta.owner, meta.date, contentHash, JSON.stringify(ids), ids.length, INDEX_VERSION, status, error];
+  if (spaceId) binds.push(spaceId);
+  await db.prepare(sql).bind(...binds).run();
 }
 
-async function markIndexPending(db, key, meta, error) {
-  await db.prepare(
-    `INSERT INTO memory_index_state
-     (memory_key, category, owner, memory_date, vector_ids_json, chunk_count, index_version, status, error, updated_at)
-     VALUES (?, ?, ?, ?, '[]', 0, ?, 'pending', ?, CURRENT_TIMESTAMP)
-     ON CONFLICT(memory_key) DO UPDATE SET
-       category=excluded.category, owner=excluded.owner, memory_date=excluded.memory_date,
-       status='pending', error=excluded.error, updated_at=CURRENT_TIMESTAMP`,
-  ).bind(key, meta.category, meta.owner, meta.date, INDEX_VERSION, error).run();
+async function markIndexPending(db, key, meta, error, spaceId = null) {
+  const sql = spaceId
+    ? `INSERT INTO memory_index_state
+       (memory_key, category, owner, memory_date, vector_ids_json, chunk_count, index_version, status, error, updated_at, space_id)
+       VALUES (?, ?, ?, ?, '[]', 0, ?, 'pending', ?, CURRENT_TIMESTAMP, ?)
+       ON CONFLICT(memory_key) DO UPDATE SET
+         category=excluded.category, owner=excluded.owner, memory_date=excluded.memory_date,
+         status='pending', error=excluded.error, updated_at=CURRENT_TIMESTAMP, space_id=excluded.space_id`
+    : `INSERT INTO memory_index_state
+       (memory_key, category, owner, memory_date, vector_ids_json, chunk_count, index_version, status, error, updated_at)
+       VALUES (?, ?, ?, ?, '[]', 0, ?, 'pending', ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(memory_key) DO UPDATE SET
+         category=excluded.category, owner=excluded.owner, memory_date=excluded.memory_date,
+         status='pending', error=excluded.error, updated_at=CURRENT_TIMESTAMP`;
+  const binds = [key, meta.category, meta.owner, meta.date, INDEX_VERSION, error];
+  if (spaceId) binds.push(spaceId);
+  await db.prepare(sql).bind(...binds).run();
 }
 
 async function readVectorIds(db, key) {
@@ -467,9 +1019,41 @@ async function exactSearch(db, query, filters, limit) {
   return result.results || [];
 }
 
-async function loadIndexedChunksByIds(db, ids) {
+async function exactSearchForSpaces(db, query, filters, limit, spaceIds) {
+  if (!spaceIds.length) return [];
+  const where = ["instr(lower(mc.chunk_text), lower(?)) > 0"];
+  const binds = [query];
+  addSqlFilters(where, binds, filters, "mc.");
+  const spaces = spaceIds.map(() => "?").join(",");
+  where.push(`COALESCE(mks.space_id, ?) IN (${spaces})`);
+  binds.push(LEGACY_SPACE_ID, ...spaceIds);
+  const sql = `SELECT mc.vector_id, mc.memory_key, mc.chunk_index, mc.chunk_text,
+                      mc.category, mc.owner, mc.memory_date, mc.content_hash, mc.index_version,
+                      COALESCE(mks.space_id, ?) AS space_id
+               FROM memory_chunks mc
+               LEFT JOIN memory_key_spaces mks ON mks.memory_key = mc.memory_key
+               WHERE ${where.join(" AND ")} LIMIT ?`;
+  const result = await db.prepare(sql).bind(LEGACY_SPACE_ID, ...binds, limit).all();
+  return result.results || [];
+}
+
+async function loadIndexedChunksByIds(db, ids, spaceIds = null) {
   if (!ids.length) return [];
   const placeholders = ids.map(() => "?").join(",");
+  if (spaceIds) {
+    if (!spaceIds.length) return [];
+    const spaces = spaceIds.map(() => "?").join(",");
+    const result = await db.prepare(
+      `SELECT mc.vector_id, mc.memory_key, mc.chunk_index, mc.chunk_text,
+              mc.category, mc.owner, mc.memory_date, mc.content_hash, mc.index_version,
+              COALESCE(mks.space_id, ?) AS space_id
+       FROM memory_chunks mc
+       LEFT JOIN memory_key_spaces mks ON mks.memory_key = mc.memory_key
+       WHERE mc.vector_id IN (${placeholders})
+         AND COALESCE(mks.space_id, ?) IN (${spaces})`,
+    ).bind(LEGACY_SPACE_ID, ...ids, LEGACY_SPACE_ID, ...spaceIds).all();
+    return result.results || [];
+  }
   const result = await db.prepare(
     `SELECT vector_id, memory_key, chunk_index, chunk_text, category, owner, memory_date
      FROM memory_chunks WHERE vector_id IN (${placeholders})`,
@@ -477,14 +1061,14 @@ async function loadIndexedChunksByIds(db, ids) {
   return result.results || [];
 }
 
-function addSqlFilters(where, binds, filters) {
-  if (filters.category) { where.push("category = ?"); binds.push(filters.category); }
-  if (filters.owner) { where.push("owner = ?"); binds.push(filters.owner); }
-  if (filters.dateFrom) { where.push("memory_date >= ?"); binds.push(filters.dateFrom); }
-  if (filters.dateTo) { where.push("memory_date <= ?"); binds.push(filters.dateTo); }
+function addSqlFilters(where, binds, filters, prefix = "") {
+  if (filters.category) { where.push(`${prefix}category = ?`); binds.push(filters.category); }
+  if (filters.owner) { where.push(`${prefix}owner = ?`); binds.push(filters.owner); }
+  if (filters.dateFrom) { where.push(`${prefix}memory_date >= ?`); binds.push(filters.dateFrom); }
+  if (filters.dateTo) { where.push(`${prefix}memory_date <= ?`); binds.push(filters.dateTo); }
 }
 
-function buildVectorFilter(filters) {
+function buildVectorFilter(filters, spaceIds = null) {
   const filter = {};
   if (filters.category) filter.cat = filters.category;
   if (filters.owner) filter.owner = filters.owner;
@@ -493,7 +1077,46 @@ function buildVectorFilter(filters) {
     if (filters.dateFrom) filter.date.$gte = filters.dateFrom;
     if (filters.dateTo) filter.date.$lte = filters.dateTo;
   }
+  if (spaceIds) {
+    if (!spaceIds.length) throw new Error("client has no recall-capable spaces");
+    filter.space = spaceIds.length === 1 ? spaceIds[0] : { $in: spaceIds };
+  }
   return filter;
+}
+
+async function semanticSearch(env, query, filters, spaceIds = null) {
+  const [embedding] = await getEmbeddings([buildQueryText(query)], env);
+  const filter = buildVectorFilter(filters, spaceIds);
+  const options = { topK: VECTOR_CANDIDATES, returnMetadata: "all" };
+  if (Object.keys(filter).length) options.filter = filter;
+  const result = await env.VECTORIZE_INDEX.query(embedding, options);
+  const matches = Array.isArray(result?.matches) ? result.matches : [];
+  const rows = await loadIndexedChunksByIds(env.DB, matches.map(({ id }) => id), spaceIds);
+  return { matches, rows };
+}
+
+function internalCandidate(row, query, semanticScore, exactSource) {
+  return {
+    ...scoreCandidate(row, query, semanticScore, exactSource),
+    vectorId: row.vector_id,
+    spaceId: row.space_id || null,
+    contentHash: row.content_hash || null,
+    indexVersion: row.index_version || INDEX_VERSION,
+  };
+}
+
+function publicSearchItem(item) {
+  return {
+    key: item.key,
+    chunkIndex: item.chunkIndex,
+    category: item.category,
+    owner: item.owner,
+    date: item.date,
+    score: item.score,
+    semanticScore: item.semanticScore,
+    exactMatch: item.exactMatch,
+    chunk: item.chunk,
+  };
 }
 
 async function listAllKeys(kv, options = {}) {
@@ -555,6 +1178,178 @@ function memoryToken(env) {
 
 function urlToken(env) {
   return env.MEMORY_TOKEN || env.MCP_URL_TOKEN;
+}
+
+function authMode(env) {
+  return String(env.V9_AUTH_MODE || "off").toLowerCase() === V9_MODE_SHADOW ? V9_MODE_SHADOW : "off";
+}
+
+function recallEnabled(env) {
+  return authMode(env) === V9_MODE_SHADOW
+    && String(env.V9_RECALL_ENABLED || "false").toLowerCase() === V9_RECALL_FLAG;
+}
+
+function legacyAuthContext(kind = "legacy-bearer") {
+  return { legacy: true, kind, clientId: null, grants: [] };
+}
+
+async function authenticateMcpRequest(request, env) {
+  if (isAuthorized(request, memoryToken(env))) return legacyAuthContext();
+  if (authMode(env) !== V9_MODE_SHADOW || !env.DB) return null;
+  const header = request.headers.get("Authorization") || "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match || match[1].length < MIN_BEARER_TOKEN_LENGTH) return null;
+  const tokenHash = await sha256Hex(match[1]);
+  const client = await env.DB.prepare(
+    `SELECT client_id, client_name FROM api_clients
+     WHERE token_hash = ? AND revoked_at IS NULL
+       AND (expires_at IS NULL OR datetime(expires_at) > CURRENT_TIMESTAMP)`,
+  ).bind(tokenHash).first();
+  if (!client) return null;
+  const rows = await env.DB.prepare(
+    `SELECT g.space_id, s.space_key, g.capability
+     FROM api_client_space_grants g
+     JOIN memory_spaces s ON s.space_id = g.space_id
+     WHERE g.client_id = ? AND g.revoked_at IS NULL AND s.disabled_at IS NULL
+       AND (g.expires_at IS NULL OR datetime(g.expires_at) > CURRENT_TIMESTAMP)`,
+  ).bind(client.client_id).all();
+  return {
+    legacy: false,
+    kind: "isolated-bearer",
+    clientId: client.client_id,
+    clientName: client.client_name,
+    grants: rows.results || [],
+  };
+}
+
+function visibleTools(auth, env) {
+  if (auth.legacy) return TOOLS.filter((tool) => !tool.v9Only).map(stripInternalToolFields);
+  return TOOLS.filter((tool) => {
+    if (tool.v9Only && !recallEnabled(env)) return false;
+    const capability = TOOL_CAPABILITIES[tool.name];
+    return capability && grantedSpaceIds(auth, capability).length > 0;
+  }).map((tool) => {
+    const clean = stripInternalToolFields(tool);
+    if (!new Set(["save_memory", "save_daily"]).has(clean.name)) return clean;
+    return {
+      ...clean,
+      inputSchema: {
+        ...clean.inputSchema,
+        properties: {
+          ...clean.inputSchema.properties,
+          spaceKey: { type: "string", maxLength: 80 },
+        },
+        required: [...new Set([...(clean.inputSchema.required || []), "spaceKey"])],
+        additionalProperties: false,
+      },
+    };
+  });
+}
+
+function stripInternalToolFields({ v9Only, ...tool }) {
+  return tool;
+}
+
+function assertToolAuthorized(auth, toolName, env) {
+  const tool = TOOLS.find(({ name }) => name === toolName);
+  if (!tool) throw new Error(`Unknown tool: ${toolName}`);
+  if (auth.legacy) {
+    if (tool.v9Only) throw new Error("tool is unavailable on the legacy channel");
+    return;
+  }
+  if (tool.v9Only && !recallEnabled(env)) throw new Error("recall tools are disabled");
+  const capability = TOOL_CAPABILITIES[toolName];
+  if (!capability || !grantedSpaceIds(auth, capability).length) {
+    throw new Error("client is not authorized for this tool");
+  }
+}
+
+function grantedSpaceIds(auth, capability) {
+  return [...new Set((auth.grants || [])
+    .filter((grant) => grant.capability === capability)
+    .map((grant) => grant.space_id))];
+}
+
+function assertSpaceCapability(auth, spaceId, capability) {
+  if (auth.legacy) return;
+  if (!(auth.grants || []).some((grant) => grant.space_id === spaceId && grant.capability === capability)) {
+    throw new Error("client is not authorized for this memory space");
+  }
+}
+
+async function requireSpaceGrant(auth, spaceKey, capability, env) {
+  const normalized = normalizeSpaceKey(spaceKey);
+  const grant = (auth.grants || []).find((item) => item.space_key === normalized && item.capability === capability);
+  if (!grant) throw new Error("client is not authorized for this memory space");
+  const space = await env.DB.prepare(
+    "SELECT space_id, space_key FROM memory_spaces WHERE space_id = ? AND disabled_at IS NULL",
+  ).bind(grant.space_id).first();
+  if (!space) throw new Error("memory space is disabled or missing");
+  return { spaceId: space.space_id, spaceKey: space.space_key };
+}
+
+async function readKeySpace(db, key) {
+  return db.prepare(
+    `SELECT mks.space_id, s.space_key
+     FROM memory_key_spaces mks JOIN memory_spaces s ON s.space_id = mks.space_id
+     WHERE mks.memory_key = ?`,
+  ).bind(key).first();
+}
+
+async function requireKeyCapability(auth, key, capability, env) {
+  const mapping = await readKeySpace(env.DB, key);
+  const spaceId = mapping?.space_id || LEGACY_SPACE_ID;
+  assertSpaceCapability(auth, spaceId, capability);
+  return { spaceId, spaceKey: mapping?.space_key || "legacy-unclassified" };
+}
+
+async function insertKeySpace(db, key, spaceId, source = "explicit") {
+  const result = await db.prepare(
+    `INSERT INTO memory_key_spaces (memory_key, space_id, assignment_source)
+     VALUES (?, ?, ?)
+     ON CONFLICT(memory_key) DO NOTHING`,
+  ).bind(key, spaceId, source).run();
+  return Number(result.meta?.changes || 0) > 0;
+}
+
+async function acquireKeyMutationLock(db, key) {
+  const lockId = crypto.randomUUID();
+  const result = await db.prepare(
+    `INSERT INTO memory_key_operation_locks (memory_key, lock_id, expires_at)
+     VALUES (?, ?, datetime(CURRENT_TIMESTAMP, '+10 minutes'))
+     ON CONFLICT(memory_key) DO UPDATE SET
+       lock_id=excluded.lock_id, expires_at=excluded.expires_at
+     WHERE datetime(memory_key_operation_locks.expires_at) <= CURRENT_TIMESTAMP`,
+  ).bind(key, lockId).run();
+  if (Number(result.meta?.changes || 0) < 1) throw new Error("another operation is in progress for this key");
+  return lockId;
+}
+
+async function releaseKeyMutationLock(db, key, lockId) {
+  try {
+    await db.prepare(
+      "DELETE FROM memory_key_operation_locks WHERE memory_key = ? AND lock_id = ?",
+    ).bind(key, lockId).run();
+  } catch {
+    // Fail closed until the short lease expires.
+  }
+}
+
+async function indexSpaceForRequest(auth, key, env) {
+  if (authMode(env) !== V9_MODE_SHADOW || !auth.legacy) return null;
+  return (await readKeySpace(env.DB, key))?.space_id || LEGACY_SPACE_ID;
+}
+
+function shouldMaintainMappings(auth, env) {
+  return !auth.legacy || authMode(env) === V9_MODE_SHADOW;
+}
+
+function normalizeSpaceKey(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9:.-]{0,79}$/.test(normalized)) {
+    throw new Error("spaceKey must be 1-80 lowercase letters, numbers, colon, dot, or hyphen");
+  }
+  return normalized;
 }
 
 function landingPage() {

@@ -161,6 +161,15 @@ export async function vectorIdFor(key, chunkIndex) {
     .slice(0, 40);
 }
 
+export async function fragmentIdFor(key, chunkIndex, contentHash, indexVersion = INDEX_VERSION) {
+  const bytes = new TextEncoder().encode(`${indexVersion}\0${key}\0${chunkIndex}\0${contentHash}`);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 40);
+}
+
 export function normalizeSearchFilters(args = {}) {
   const filters = {};
   for (const key of ["category", "owner"]) {

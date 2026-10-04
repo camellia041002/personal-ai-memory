@@ -57,11 +57,13 @@ test("V8 deploy package applies schema and all required metadata indexes", async
   assert.match(packageJson.scripts.deploy, /wrangler deploy/);
 
   const setup = await readFile(path.join(root, "v8", "scripts", "setup-vectorize.mjs"), "utf8");
-  for (const property of ["cat", "owner", "date"]) assert.match(setup, new RegExp(`"${property}"`));
+  for (const property of ["cat", "owner", "date", "space"]) assert.match(setup, new RegExp(`"${property}"`));
 
-  const rootMigration = await readFile(path.join(root, "migrations", "0001_schema.sql"), "utf8");
-  const deployMigration = await readFile(path.join(root, "v8", "migrations", "0001_schema.sql"), "utf8");
-  assert.equal(deployMigration, rootMigration);
+  for (const migration of ["0001_schema.sql", "0002_v9_access_spaces.sql"]) {
+    const rootMigration = await readFile(path.join(root, "migrations", migration), "utf8");
+    const deployMigration = await readFile(path.join(root, "v8", "migrations", migration), "utf8");
+    assert.equal(deployMigration, rootMigration);
+  }
 });
 
 test("a fully replaced Hybrid V8 config is deployable", () => {

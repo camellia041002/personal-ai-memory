@@ -13,7 +13,7 @@ V8 是带混合搜索和索引恢复能力的完整版本。它仍是一个部�
 2. `ADMIN_TOKEN`：另一条不同的随机串，只用于索引检查和恢复。
 3. Vectorize：填写 `Dimensions = 1024`、`Metric = cosine`。
 
-部署命令会自动执行 D1 migration，并请求创建 `cat`、`owner`、`date` 三个 Vectorize metadata index。Cloudflare 的 metadata index 创建是异步的；部署后应等它们在控制台中显示，再测试带筛选的语义搜索。
+部署命令会自动执行 D1 migration，并请求创建 `cat`、`owner`、`date`、`space` 四个 Vectorize metadata index。`space` 为默认关闭的 V9 shadow 功能预留；V8 默认行为不依赖它。Cloudflare 的 metadata index 创建是异步的；部署后应等它们在控制台中显示，再测试带筛选的语义搜索。
 
 连接方式与 Lite 相同：
 
