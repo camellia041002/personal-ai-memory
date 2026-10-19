@@ -219,6 +219,9 @@ const MIN_URL_TOKEN_LENGTH = 43;
 const URL_TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/;
 const V9_MODE_SHADOW = "shadow";
 const V9_RECALL_FLAG = "true";
+const V9_INFRA_FLAG = "true";
+const RECYCLE_RETENTION_DAYS = 30;
+const AUDIT_PENDING_RECONCILE_MINUTES = 10;
 const LEGACY_SPACE_ID = "space-legacy-unclassified";
 const RESERVED_SPACE_KEYS = new Set(["shared", "admin", "legacy-unclassified"]);
 const CAPABILITIES = new Set(["read", "recall", "write", "delete"]);
@@ -232,6 +235,9 @@ const TOOL_CAPABILITIES = Object.freeze({
   recall_memory: "recall",
   report_recall_feedback: "recall",
   delete_memory: "delete",
+  restore_memory: "delete",
+  list_recycle_bin: "delete",
+  borrow_memory: "borrow",
 });
 
 export default {
@@ -241,11 +247,13 @@ export default {
     if (url.pathname === "/") return landingPage();
     if (url.pathname.startsWith("/admin/")) return handleAdmin(request, env, url);
     const bearerEndpoint = url.pathname === "/mcp";
-    const secretUrlEndpoint = isAuthorizedUrlPath(url.pathname, urlToken(env));
+    const pathToken = urlPathToken(url.pathname);
+    const secretUrlEndpoint = isAuthorizedUrlPath(url.pathname, urlToken(env))
+      || (infraEnabled(env) && Boolean(pathToken));
     if (!bearerEndpoint && !secretUrlEndpoint) return new Response("Not Found", { status: 404 });
     if (request.method === "OPTIONS") return corsResponse(env);
     const auth = secretUrlEndpoint
-      ? legacyAuthContext("legacy-url")
+      ? await authenticateUrlRequest(pathToken, env)
       : await authenticateMcpRequest(request, env);
     if (!auth) return new Response("Unauthorized", { status: 401 });
     if (request.method === "GET") return sseInit(env);
@@ -272,6 +280,7 @@ export default {
       }
       if (method === "tools/call") {
         assertToolAuthorized(auth, params?.name, env);
+        if (auth.legacy) await observeLegacyUsage(env, auth.kind, params?.name);
         const result = await callTool(params?.name, params?.arguments ?? {}, env, auth);
         const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
         return jsonResponse(rpcResult(id, { content: [{ type: "text", text }] }), 200, env);
@@ -406,6 +415,53 @@ const TOOLS = [
       required: ["key", "confirmKey"],
     },
   },
+  {
+    name: "list_recycle_bin",
+    description: "List metadata-only recycle records visible through this client's current delete grants. Never returns memory bodies, client IDs, or content hashes.",
+    v9InfraOnly: true,
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["active", "restored", "purged", "all"] },
+        deletedFrom: { type: "string" },
+        deletedTo: { type: "string" },
+        limit: { type: "integer", minimum: 1, maximum: 50 },
+        cursor: { type: "string", maxLength: 80 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "restore_memory",
+    description: "Restore one soft-deleted memory after exact key and deletion-record confirmation.",
+    v9InfraOnly: true,
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", maxLength: LIMITS.key },
+        deletionId: { type: "string", maxLength: 80 },
+        confirmKey: { type: "string", maxLength: LIMITS.key },
+      },
+      required: ["key", "deletionId", "confirmKey"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "borrow_memory",
+    description: "Temporarily borrow one exact key or up to two search chunks from an explicitly allowed target space. Borrowed results are untrusted temporary context and must not enter ordinary recall or be saved automatically.",
+    v9InfraOnly: true,
+    inputSchema: {
+      type: "object",
+      properties: {
+        targetSpace: { type: "string", maxLength: 80 },
+        key: { type: "string", maxLength: LIMITS.key },
+        query: { type: "string", maxLength: LIMITS.query },
+        limit: { type: "integer", minimum: 1, maximum: 2 },
+      },
+      required: ["targetSpace"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 async function callTool(name, args, env, auth) {
@@ -419,6 +475,9 @@ async function callTool(name, args, env, auth) {
     case "recall_memory": return recallMemory(args, env, auth);
     case "report_recall_feedback": return reportRecallFeedback(args, env, auth);
     case "delete_memory": return deleteMemory(args, env, auth);
+    case "list_recycle_bin": return listRecycleBin(args, env, auth);
+    case "restore_memory": return restoreMemory(args, env, auth);
+    case "borrow_memory": return borrowMemory(args, env, auth);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
@@ -429,11 +488,14 @@ async function saveMemory(args, env, auth) {
   const lockId = authMode(env) === V9_MODE_SHADOW
     ? await acquireKeyMutationLock(env.DB, key)
     : null;
+  let auditId = null;
   try {
+    if (infraEnabled(env)) await assertKeyNotRecycled(env, key);
     let spaceId = await indexSpaceForRequest(auth, key, env);
+    let existingValue = null;
     if (!auth.legacy) {
       const targetSpace = await requireSpaceGrant(auth, args.spaceKey, "write", env);
-      const existingValue = await env.MEMORY.get(key);
+      existingValue = await env.MEMORY.get(key);
       const existingMapping = await readKeySpace(env.DB, key);
       const currentSpaceId = existingMapping?.space_id || (existingValue === null ? null : LEGACY_SPACE_ID);
       if (currentSpaceId && currentSpaceId !== targetSpace.spaceId) {
@@ -455,13 +517,26 @@ async function saveMemory(args, env, auth) {
         }
       }
       spaceId = targetSpace.spaceId;
+    } else if (infraEnabled(env)) {
+      existingValue = await env.MEMORY.get(key);
     }
+    const contentHash = infraEnabled(env) ? await sha256Hex(value) : null;
+    auditId = await beginMutationAudit(
+      env,
+      auth,
+      existingValue === null ? "create" : "update",
+      key,
+      spaceId,
+      { contentHash },
+    );
     await env.MEMORY.put(key, value);
     try {
       const indexResult = await indexMemory(key, value, env, spaceId);
+      await finishMutationAudit(env, auditId, "success");
       return { key, kv: "ok", ...indexResult };
     } catch (error) {
       await markIndexPending(env.DB, key, classifyKey(key), safeError(error), spaceId);
+      await finishMutationAudit(env, auditId, "index_pending", errorClass(error));
       return { key, kv: "ok", index: "pending", error: safeError(error) };
     }
   } finally {
@@ -475,8 +550,14 @@ async function saveDaily(args, env, auth) {
   if (!isIsoDate(date)) throw new Error("date must be YYYY-MM-DD");
   validateKeyValue(`${safeOwner}_daily_${date}`, value);
   const prefix = `${safeOwner}_daily_${date}`;
+  const cleanNote = normalizeDailyNote(note);
+  const key = cleanNote ? `${prefix}_${cleanNote}` : prefix;
   const existing = await listAllKeys(env.MEMORY, { prefix });
   let conflicts = existing.filter((key) => key === prefix || key.startsWith(`${prefix}_`));
+  if (infraEnabled(env) && conflicts.length) {
+    const recycled = await readActiveRecycledKeySet(env, conflicts);
+    conflicts = conflicts.filter((candidate) => candidate === key || !recycled.has(candidate));
+  }
   if (!auth.legacy && conflicts.length) {
     const targetSpace = await requireSpaceGrant(auth, args.spaceKey, "write", env);
     const mappings = await readKeySpacesForKeys(env.DB, conflicts);
@@ -486,8 +567,6 @@ async function saveDaily(args, env, auth) {
   }
   if (conflicts.length && !overwrite) throw new Error("an entry already exists for this owner and date");
 
-  const cleanNote = normalizeDailyNote(note);
-  const key = cleanNote ? `${prefix}_${cleanNote}` : prefix;
   if (!auth.legacy && overwrite) {
     for (const oldKey of conflicts) {
       if (oldKey !== key) await requireKeyCapability(auth, oldKey, "delete", env);
@@ -508,6 +587,7 @@ async function saveDaily(args, env, auth) {
 async function getMemory({ key }, env, auth) {
   validateKeyValue(key, "");
   if (!auth.legacy) await requireKeyCapability(auth, key, "read", env);
+  if (infraEnabled(env) && await isKeyRecycled(env, key)) return `Not found: ${key}`;
   const value = await env.MEMORY.get(key);
   return value === null ? `Not found: ${key}` : value;
 }
@@ -521,7 +601,9 @@ async function findMemoryKeys(args, env, auth) {
   if (query) normalizeQuery(query);
   if (prefix && prefix.length > LIMITS.key) throw new Error(`prefix must not exceed ${LIMITS.key} characters`);
   const limit = clampInt(args.limit, 10, 1, LIMITS.findKeys);
-  const keys = await listAllKeys(env.MEMORY, { prefix: prefix?.trim() || undefined });
+  const listedKeys = await listAllKeys(env.MEMORY, { prefix: prefix?.trim() || undefined });
+  const recycled = infraEnabled(env) ? await readActiveRecycledKeySet(env, listedKeys) : new Set();
+  const keys = listedKeys.filter((key) => !recycled.has(key));
   const needle = query?.trim().toLocaleLowerCase("zh-CN");
   const candidates = [];
   for (const key of keys) {
@@ -559,7 +641,9 @@ async function getRecentDailies(args, env, auth) {
   const owner = args.owner || "all";
   if (owner !== "all") normalizeOwner(owner);
   const days = clampInt(args.days, 3, 1, LIMITS.recentDays);
-  const keys = await listAllKeys(env.MEMORY);
+  const listedKeys = await listAllKeys(env.MEMORY);
+  const recycled = infraEnabled(env) ? await readActiveRecycledKeySet(env, listedKeys) : new Set();
+  const keys = listedKeys.filter((key) => !recycled.has(key));
   const matches = keys.map((key) => ({ key, meta: classifyKey(key) }))
     .filter(({ meta }) => meta.category === "daily" && (owner === "all" || meta.owner === owner))
     .sort((left, right) => right.meta.date.localeCompare(left.meta.date) || left.key.localeCompare(right.key));
@@ -763,6 +847,7 @@ async function hybridSearch(args, env, { spaceIds = null, tolerant = false } = {
   const perKey = new Map();
   const results = [];
   for (const item of [...candidates.values()].sort((left, right) => right.score - left.score)) {
+    if (infraEnabled(env) && await isKeyRecycled(env, item.key)) continue;
     const count = perKey.get(item.key) || 0;
     if (count >= MAX_RESULTS_PER_KEY) continue;
     perKey.set(item.key, count + 1);
@@ -775,15 +860,258 @@ async function hybridSearch(args, env, { spaceIds = null, tolerant = false } = {
 async function deleteMemory({ key, confirmKey }, env, auth) {
   validateKeyValue(key, "");
   if (confirmKey !== key) throw new Error("confirmKey must exactly match key");
+  if (infraEnabled(env) && !auth.legacy) return softDeleteMemory(key, env, auth);
   const lockId = authMode(env) === V9_MODE_SHADOW
     ? await acquireKeyMutationLock(env.DB, key)
     : null;
   try {
+    if (infraEnabled(env) && auth.legacy && await readActiveRecycleRow(env.DB, key)) {
+      throw new Error("active recycle records require restore or explicit administrator purge");
+    }
     if (!auth.legacy) await requireKeyCapability(auth, key, "delete", env);
     await removeMemoryEverywhere(key, env, true, shouldMaintainMappings(auth, env));
     return { key, deleted: true };
   } finally {
     if (lockId) await releaseKeyMutationLock(env.DB, key, lockId);
+  }
+}
+
+async function softDeleteMemory(key, env, auth) {
+  const lockId = await acquireKeyMutationLock(env.DB, key);
+  try {
+    const mapping = auth.legacy
+      ? await readKeySpace(env.DB, key)
+      : await requireKeyCapability(auth, key, "delete", env);
+    const spaceId = mapping?.space_id || mapping?.spaceId || LEGACY_SPACE_ID;
+    if (!mapping || spaceId === LEGACY_SPACE_ID) {
+      throw new Error("soft delete requires an explicit access-space mapping");
+    }
+    if (await readActiveRecycleRow(env.DB, key)) throw new Error("key is already in the recycle bin");
+    const value = await env.MEMORY.get(key);
+    if (value === null) throw new Error("key does not exist");
+    const state = await env.DB.prepare(
+      "SELECT content_hash, index_version FROM memory_index_state WHERE memory_key = ?",
+    ).bind(key).first();
+    const contentHash = await sha256Hex(value);
+    const deletionId = crypto.randomUUID();
+    const operationId = crypto.randomUUID();
+    const purgeAfter = new Date(Date.now() + RECYCLE_RETENTION_DAYS * 86_400_000).toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO memory_recycle_bin
+         (deletion_id, memory_key, space_id, deleted_by_client_id, deleted_auth_kind,
+          purge_after, content_hash, index_version)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(
+        deletionId,
+        key,
+        spaceId,
+        auth.clientId || null,
+        auth.kind || "unknown",
+        purgeAfter,
+        contentHash,
+        state?.index_version || INDEX_VERSION,
+      ),
+      env.DB.prepare(
+        `INSERT INTO memory_mutation_audit
+         (operation_id, client_id, auth_kind, action, memory_key, space_id,
+          deletion_id, content_hash, status)
+         VALUES (?, ?, ?, 'soft_delete', ?, ?, ?, ?, 'pending')`,
+      ).bind(operationId, auth.clientId || null, auth.kind || "unknown", key, spaceId, deletionId, contentHash),
+    ]);
+    try {
+      await purgeIndexForKey(key, env);
+      await finishMutationAudit(env, operationId, "success");
+      return { key, recycled: true, deletionId, purgeAfter, index: "removed" };
+    } catch (error) {
+      await finishMutationAudit(env, operationId, "uncertain", errorClass(error));
+      return { key, recycled: true, deletionId, purgeAfter, index: "pending" };
+    }
+  } finally {
+    await releaseKeyMutationLock(env.DB, key, lockId);
+  }
+}
+
+async function listRecycleBin(args, env, auth) {
+  if (auth.legacy) throw new Error("recycle listing requires an isolated client token");
+  const status = args.status || "active";
+  if (!new Set(["active", "restored", "purged", "all"]).has(status)) {
+    throw new Error("status must be active, restored, purged, or all");
+  }
+  const deletedFrom = normalizeOptionalDateTime(args.deletedFrom, "deletedFrom");
+  const deletedTo = normalizeOptionalDateTime(args.deletedTo, "deletedTo");
+  if (deletedFrom && deletedTo && Date.parse(deletedFrom) > Date.parse(deletedTo)) {
+    throw new Error("deletedFrom must not be later than deletedTo");
+  }
+  const limit = clampInt(args.limit, 20, 1, 50);
+  const cursor = typeof args.cursor === "string" && args.cursor.trim() ? args.cursor.trim() : null;
+  const spaceIds = grantedSpaceIds(auth, "delete");
+  if (!spaceIds.length) throw new Error("client has no delete-granted recycle scope");
+  const accessId = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO memory_recycle_list_audit
+     (access_id, client_id, auth_kind, status_filter, deleted_from, deleted_to, status)
+     VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
+  ).bind(accessId, auth.clientId, auth.kind, status, deletedFrom, deletedTo).run();
+  try {
+    let cursorRow = null;
+    if (cursor) {
+      const placeholders = spaceIds.map(() => "?").join(",");
+      cursorRow = await env.DB.prepare(
+        `SELECT deletion_id, deleted_at FROM memory_recycle_bin
+         WHERE deletion_id = ? AND space_id IN (${placeholders})`,
+      ).bind(cursor, ...spaceIds).first();
+      if (!cursorRow) throw new Error("invalid or invisible cursor");
+    }
+    const placeholders = spaceIds.map(() => "?").join(",");
+    const where = [`rb.space_id IN (${placeholders})`];
+    const binds = [...spaceIds];
+    if (status !== "all") { where.push("rb.status = ?"); binds.push(status); }
+    if (deletedFrom) { where.push("datetime(rb.deleted_at) >= datetime(?)"); binds.push(deletedFrom); }
+    if (deletedTo) { where.push("datetime(rb.deleted_at) <= datetime(?)"); binds.push(deletedTo); }
+    if (cursorRow) {
+      where.push("(datetime(rb.deleted_at) < datetime(?) OR (datetime(rb.deleted_at) = datetime(?) AND rb.deletion_id < ?))");
+      binds.push(cursorRow.deleted_at, cursorRow.deleted_at, cursorRow.deletion_id);
+    }
+    const rows = await env.DB.prepare(
+      `SELECT rb.deletion_id, rb.memory_key, s.space_key, rb.deleted_at,
+              CASE WHEN rb.deleted_by_client_id IS NULL THEN 'legacy' ELSE 'isolated' END AS deleted_by,
+              rb.status, rb.restored_at,
+              CASE WHEN rb.restored_by_client_id IS NULL THEN NULL ELSE 'isolated' END AS restored_by,
+              rb.purged_at
+       FROM memory_recycle_bin rb JOIN memory_spaces s ON s.space_id = rb.space_id
+       WHERE ${where.join(" AND ")}
+       ORDER BY datetime(rb.deleted_at) DESC, rb.deletion_id DESC LIMIT ?`,
+    ).bind(...binds, limit + 1).all();
+    const visible = rows.results || [];
+    const page = visible.slice(0, limit);
+    const results = page.map((row) => ({
+      deletionId: row.deletion_id,
+      key: row.memory_key,
+      space: row.space_key,
+      deletedAt: row.deleted_at,
+      deletedBy: row.deleted_by,
+      status: row.status,
+      restoredAt: row.restored_at || null,
+      restoredBy: row.restored_by || null,
+      purgedAt: row.purged_at || null,
+    }));
+    const completed = await env.DB.prepare(
+      `UPDATE memory_recycle_list_audit SET status='success', result_count=?, completed_at=CURRENT_TIMESTAMP
+       WHERE access_id=? AND status='pending'`,
+    ).bind(results.length, accessId).run();
+    if (Number(completed.meta?.changes || 0) !== 1) throw new Error("recycle-list audit did not complete");
+    return {
+      status,
+      limit,
+      count: results.length,
+      results,
+      nextCursor: visible.length > limit && page.length ? page.at(-1).deletion_id : null,
+    };
+  } catch (error) {
+    try {
+      await env.DB.prepare(
+        `UPDATE memory_recycle_list_audit SET status='failure', error_class=?, completed_at=CURRENT_TIMESTAMP
+         WHERE access_id=? AND status='pending'`,
+      ).bind(errorClass(error), accessId).run();
+    } catch {}
+    throw error;
+  }
+}
+
+async function restoreMemory({ key, deletionId, confirmKey }, env, auth) {
+  validateKeyValue(key, "");
+  if (auth.legacy) throw new Error("restore requires an isolated client token");
+  if (confirmKey !== key) throw new Error("confirmKey must exactly match key");
+  if (!deletionId) throw new Error("deletionId is required");
+  const lockId = await acquireKeyMutationLock(env.DB, key);
+  let operationId = null;
+  try {
+    const recycled = await env.DB.prepare(
+      `SELECT deletion_id, space_id, content_hash FROM memory_recycle_bin
+       WHERE deletion_id=? AND memory_key=? AND status='active'`,
+    ).bind(deletionId, key).first();
+    if (!recycled) throw new Error("active recycle record not found");
+    assertSpaceCapability(auth, recycled.space_id, "delete");
+    const value = await env.MEMORY.get(key);
+    if (value === null) throw new Error("recycled source body no longer exists");
+    const contentHash = await sha256Hex(value);
+    if (contentHash !== recycled.content_hash) throw new Error("same-key content changed; restore refused");
+    operationId = await beginMutationAudit(env, auth, "restore", key, recycled.space_id, { deletionId, contentHash });
+    await indexMemory(key, value, env, recycled.space_id);
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE memory_recycle_bin SET status='restored', restored_by_client_id=?, restored_at=CURRENT_TIMESTAMP
+         WHERE deletion_id=? AND status='active'`,
+      ).bind(auth.clientId, deletionId),
+      env.DB.prepare(
+        `UPDATE memory_mutation_audit SET status='success', completed_at=CURRENT_TIMESTAMP, error_class=NULL
+         WHERE operation_id=? AND status='pending'`,
+      ).bind(operationId),
+    ]);
+    return { key, deletionId, restored: true, index: "ok" };
+  } catch (error) {
+    if (operationId) await finishMutationAudit(env, operationId, "uncertain", errorClass(error));
+    throw error;
+  } finally {
+    await releaseKeyMutationLock(env.DB, key, lockId);
+  }
+}
+
+async function borrowMemory(args, env, auth) {
+  if (auth.legacy || !auth.borrowEnabled) throw new Error("borrow is not enabled for this client");
+  const targetSpace = normalizeSpaceKey(args.targetSpace);
+  const allowed = (auth.borrowSpaces || []).find((item) => item.space_key === targetSpace);
+  if (!allowed) throw new Error("target space is not in this client's borrow allowlist");
+  const hasKey = typeof args.key === "string" && args.key.trim().length > 0;
+  const hasQuery = typeof args.query === "string" && args.query.trim().length > 0;
+  if (hasKey === hasQuery) throw new Error("provide exactly one of key or query");
+  const targetKey = hasKey ? String(args.key).trim() : null;
+  if (targetKey) validateKeyValue(targetKey, "");
+  const query = hasQuery ? normalizeQuery(args.query) : null;
+  const borrowId = crypto.randomUUID();
+  const inserted = await env.DB.prepare(
+    `INSERT INTO memory_borrow_audit
+     (borrow_id, client_id, target_space_id, mode, target_key, query_hash, status)
+     SELECT ?, ?, ?, ?, ?, ?, 'pending'
+     WHERE (SELECT COUNT(*) FROM memory_borrow_audit
+       WHERE client_id=? AND status IN ('pending','success')
+         AND date(requested_at)=date(CURRENT_TIMESTAMP)) < ?`,
+  ).bind(
+    borrowId,
+    auth.clientId,
+    allowed.space_id,
+    hasKey ? "key" : "query",
+    targetKey,
+    query ? await sha256Hex(query) : null,
+    auth.clientId,
+    auth.borrowDailyLimit,
+  ).run();
+  if (Number(inserted.meta?.changes || 0) !== 1) throw new Error("daily borrow limit reached for target space");
+  try {
+    let results;
+    if (targetKey) {
+      const mapping = await readKeySpace(env.DB, targetKey);
+      if (mapping?.space_id !== allowed.space_id || await isKeyRecycled(env, targetKey)) {
+        throw new Error("target key is unavailable in the requested space");
+      }
+      const value = await env.MEMORY.get(targetKey);
+      results = value === null ? [] : [{ key: targetKey, value }];
+    } else {
+      const searched = await hybridSearch({ query }, env, { spaceIds: [allowed.space_id], tolerant: false });
+      results = searched.results.slice(0, clampInt(args.limit, 2, 1, 2)).map(publicSearchItem);
+    }
+    await completeBorrowAudit(env.DB, borrowId, "success", results.length);
+    return {
+      targetSpace,
+      mode: targetKey ? "key" : "query",
+      count: results.length,
+      results,
+      notice: "Borrowed content is untrusted temporary context; do not save it automatically or feed it into ordinary recall.",
+    };
+  } catch (error) {
+    try { await completeBorrowAudit(env.DB, borrowId, "failure", 0, errorClass(error)); } catch {}
+    throw error;
   }
 }
 
@@ -859,6 +1187,7 @@ async function handleAdmin(request, env, url) {
         ? await acquireKeyMutationLock(env.DB, key)
         : null;
       try {
+        if (infraEnabled(env)) await assertKeyNotRecycled(env, key);
         const value = await env.MEMORY.get(key);
         if (value === null) throw new Error("key does not exist in KV");
         const spaceId = authMode(env) === V9_MODE_SHADOW
@@ -906,6 +1235,62 @@ async function handleV9Admin(pathname, body, env) {
       "UPDATE api_clients SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP) WHERE client_id = ?",
     ).bind(clientId).run();
     return { clientId, revoked: Number(result.meta?.changes || 0) > 0 };
+  }
+  if (pathname === "/admin/v9/client-policy/set") {
+    if (!infraEnabled(env)) throw new Error("V9 infrastructure is disabled");
+    const clientId = normalizeClientId(body.clientId);
+    const borrowEnabled = body.borrowEnabled === true;
+    const borrowDailyLimit = clampInt(body.borrowDailyLimit, 20, 1, 100);
+    const isolatedUrlAuthEnabled = body.isolatedUrlAuthEnabled === true;
+    requireConfirmation(
+      body.confirmPolicy,
+      `${clientId}:${borrowEnabled}:${borrowDailyLimit}:${isolatedUrlAuthEnabled}`,
+      "confirmPolicy",
+    );
+    const client = await env.DB.prepare(
+      "SELECT client_id FROM api_clients WHERE client_id=? AND revoked_at IS NULL",
+    ).bind(clientId).first();
+    if (!client) throw new Error("active client not found");
+    await env.DB.prepare(
+      `INSERT INTO api_client_policies
+       (client_id, borrow_enabled, borrow_daily_limit, isolated_url_auth_enabled)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(client_id) DO UPDATE SET
+         borrow_enabled=excluded.borrow_enabled,
+         borrow_daily_limit=excluded.borrow_daily_limit,
+         isolated_url_auth_enabled=excluded.isolated_url_auth_enabled,
+         updated_at=CURRENT_TIMESTAMP`,
+    ).bind(clientId, borrowEnabled ? 1 : 0, borrowDailyLimit, isolatedUrlAuthEnabled ? 1 : 0).run();
+    return { clientId, borrowEnabled, borrowDailyLimit, isolatedUrlAuthEnabled };
+  }
+  if (pathname === "/admin/v9/borrow-spaces/grant") {
+    if (!infraEnabled(env)) throw new Error("V9 infrastructure is disabled");
+    const clientId = normalizeClientId(body.clientId);
+    const spaceKey = normalizeSpaceKey(body.spaceKey);
+    requireConfirmation(body.confirmBorrowGrant, `${clientId}:${spaceKey}`, "confirmBorrowGrant");
+    const expiresAt = normalizeOptionalTimestamp(body.expiresAt, "expiresAt");
+    const space = await env.DB.prepare(
+      "SELECT space_id FROM memory_spaces WHERE space_key=? AND disabled_at IS NULL",
+    ).bind(spaceKey).first();
+    if (!space) throw new Error("active target space not found");
+    await env.DB.prepare(
+      `INSERT INTO api_client_borrow_spaces (client_id, target_space_id, expires_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(client_id, target_space_id) DO UPDATE SET
+         expires_at=excluded.expires_at, revoked_at=NULL, granted_at=CURRENT_TIMESTAMP`,
+    ).bind(clientId, space.space_id, expiresAt).run();
+    return { clientId, spaceKey, expiresAt };
+  }
+  if (pathname === "/admin/v9/borrow-spaces/revoke") {
+    if (!infraEnabled(env)) throw new Error("V9 infrastructure is disabled");
+    const clientId = normalizeClientId(body.clientId);
+    const spaceKey = normalizeSpaceKey(body.spaceKey);
+    requireConfirmation(body.confirmBorrowGrant, `${clientId}:${spaceKey}`, "confirmBorrowGrant");
+    const result = await env.DB.prepare(
+      `UPDATE api_client_borrow_spaces SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP)
+       WHERE client_id=? AND target_space_id=(SELECT space_id FROM memory_spaces WHERE space_key=?)`,
+    ).bind(clientId, spaceKey).run();
+    return { clientId, spaceKey, revoked: Number(result.meta?.changes || 0) > 0 };
   }
   if (pathname === "/admin/v9/spaces/create") {
     const spaceKey = normalizeSpaceKey(body.spaceKey);
@@ -997,6 +1382,9 @@ async function handleV9Admin(pathname, body, env) {
     requireConfirmation(body.confirmKey, key, "confirmKey");
     const lockId = await acquireKeyMutationLock(env.DB, key);
     try {
+      if (infraEnabled(env) && await readActiveRecycleRow(env.DB, key)) {
+        throw new Error("cannot reassign an actively recycled key");
+      }
       const value = await env.MEMORY.get(key);
       const current = await readKeySpace(env.DB, key);
       if (value === null && !current) throw new Error("key does not exist in KV or space mappings");
@@ -1047,6 +1435,25 @@ async function handleV9Admin(pathname, body, env) {
       unmappedOrDifferent: keys.length - alreadyMapped,
       materialized: false,
     };
+  }
+  if (pathname === "/admin/v9/audit/reconcile-pending") {
+    if (!infraEnabled(env)) throw new Error("V9 infrastructure is disabled");
+    requireBooleanConfirmation(body.confirmReconcile, "confirmReconcile");
+    return reconcilePendingMutationAudits(env, clampInt(body.limit, 50, 1, 100));
+  }
+  if (pathname === "/admin/v9/recycle/repair-active") {
+    if (!infraEnabled(env)) throw new Error("V9 infrastructure is disabled");
+    requireBooleanConfirmation(body.confirmRepair, "confirmRepair");
+    return repairActiveRecycleRows(env, clampInt(body.limit, 20, 1, 50));
+  }
+  if (pathname === "/admin/v9/recycle/purge-one") {
+    if (!infraEnabled(env)) throw new Error("V9 infrastructure is disabled");
+    const deletionId = String(body.deletionId || "").trim();
+    const key = String(body.key || "");
+    validateKeyValue(key, "");
+    if (!deletionId || deletionId.length > 80) throw new Error("deletionId is required");
+    requireConfirmation(body.confirmPurge, `${deletionId}:${key}:PERMANENT`, "confirmPurge");
+    return purgeRecycleRow(env, deletionId, key);
   }
   throw new Error("unknown V9 admin operation");
 }
@@ -1106,6 +1513,212 @@ async function removeMemoryEverywhere(key, env, deleteKv, deleteMapping = false)
   await purgeIndexForKey(key, env);
   if (deleteKv) await env.MEMORY.delete(key);
   if (deleteMapping) await env.DB.prepare("DELETE FROM memory_key_spaces WHERE memory_key = ?").bind(key).run();
+}
+
+async function readActiveRecycleRow(db, key) {
+  return db.prepare(
+    `SELECT deletion_id, memory_key, space_id, content_hash, index_version, purge_after
+     FROM memory_recycle_bin WHERE memory_key=? AND status='active'`,
+  ).bind(key).first();
+}
+
+async function isKeyRecycled(env, key) {
+  return infraEnabled(env) && Boolean(await readActiveRecycleRow(env.DB, key));
+}
+
+async function assertKeyNotRecycled(env, key) {
+  if (await isKeyRecycled(env, key)) throw new Error("key is hidden in the recycle bin; restore it or use a new key");
+}
+
+async function readActiveRecycledKeySet(env, keys) {
+  const recycled = new Set();
+  for (let offset = 0; offset < keys.length; offset += 80) {
+    const batch = keys.slice(offset, offset + 80);
+    if (!batch.length) continue;
+    const placeholders = batch.map(() => "?").join(",");
+    const rows = await env.DB.prepare(
+      `SELECT memory_key FROM memory_recycle_bin
+       WHERE status='active' AND memory_key IN (${placeholders})`,
+    ).bind(...batch).all();
+    for (const row of rows.results || []) recycled.add(row.memory_key);
+  }
+  return recycled;
+}
+
+async function beginMutationAudit(env, auth, action, key, spaceId, {
+  deletionId = null,
+  contentHash = null,
+} = {}) {
+  if (!infraEnabled(env)) return null;
+  const operationId = crypto.randomUUID();
+  await env.DB.prepare(
+    `INSERT INTO memory_mutation_audit
+     (operation_id, client_id, auth_kind, action, memory_key, space_id, deletion_id, content_hash, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+  ).bind(
+    operationId,
+    auth.clientId || null,
+    auth.kind || "unknown",
+    action,
+    key,
+    spaceId || null,
+    deletionId,
+    contentHash,
+  ).run();
+  return operationId;
+}
+
+async function finishMutationAudit(env, operationId, status, error = null) {
+  if (!operationId) return true;
+  try {
+    const result = await env.DB.prepare(
+      `UPDATE memory_mutation_audit SET status=?, error_class=?, completed_at=CURRENT_TIMESTAMP
+       WHERE operation_id=? AND status='pending'`,
+    ).bind(status, error, operationId).run();
+    return Number(result.meta?.changes || 0) === 1;
+  } catch {
+    return false;
+  }
+}
+
+async function completeBorrowAudit(db, borrowId, status, resultCount, error = null) {
+  const result = await db.prepare(
+    `UPDATE memory_borrow_audit SET status=?, result_count=?, error_class=?, completed_at=CURRENT_TIMESTAMP
+     WHERE borrow_id=? AND status='pending'`,
+  ).bind(status, resultCount, error, borrowId).run();
+  if (Number(result.meta?.changes || 0) !== 1) throw new Error("borrow audit did not complete");
+}
+
+async function observeLegacyUsage(env, routeKind, toolName) {
+  if (!infraEnabled(env)) return;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO legacy_usage_observations (route_kind, tool_name, action_date, call_count)
+       VALUES (?, ?, date(CURRENT_TIMESTAMP), 1)
+       ON CONFLICT(route_kind, tool_name, action_date) DO UPDATE SET
+         call_count=legacy_usage_observations.call_count+1, last_seen_at=CURRENT_TIMESTAMP`,
+    ).bind(String(routeKind || "legacy"), String(toolName || "unknown")).run();
+  } catch {
+    // Observation must not alter the compatibility response.
+  }
+}
+
+async function reconcilePendingMutationAudits(env, limit) {
+  const rows = await env.DB.prepare(
+    `SELECT operation_id, action, memory_key, deletion_id, content_hash
+     FROM memory_mutation_audit WHERE status='pending'
+       AND datetime(started_at) <= datetime(CURRENT_TIMESTAMP, ?)
+     ORDER BY datetime(started_at) LIMIT ?`,
+  ).bind(`-${AUDIT_PENDING_RECONCILE_MINUTES} minutes`, limit).all();
+  const summary = { examined: 0, success: 0, indexPending: 0, uncertain: 0 };
+  for (const row of rows.results || []) {
+    summary.examined += 1;
+    const [value, indexState, recycle] = await Promise.all([
+      env.MEMORY.get(row.memory_key),
+      env.DB.prepare("SELECT status, content_hash FROM memory_index_state WHERE memory_key=?")
+        .bind(row.memory_key).first(),
+      row.deletion_id
+        ? env.DB.prepare("SELECT status FROM memory_recycle_bin WHERE deletion_id=?").bind(row.deletion_id).first()
+        : Promise.resolve(null),
+    ]);
+    const currentHash = value === null ? null : await sha256Hex(value);
+    let status = "uncertain";
+    if (new Set(["create", "update"]).has(row.action) && currentHash === row.content_hash) {
+      status = new Set(["ok", "skipped"]).has(indexState?.status) && indexState.content_hash === row.content_hash
+        ? "success" : "index_pending";
+    } else if (row.action === "soft_delete" && recycle?.status === "active") {
+      status = indexState ? "uncertain" : "success";
+    } else if (row.action === "restore" && recycle?.status === "restored"
+      && currentHash === row.content_hash && indexState?.status === "ok") {
+      status = "success";
+    }
+    await env.DB.prepare(
+      `UPDATE memory_mutation_audit SET status=?, error_class=?, completed_at=CURRENT_TIMESTAMP
+       WHERE operation_id=? AND status='pending'`,
+    ).bind(status, status === "uncertain" ? "reconcile" : null, row.operation_id).run();
+    if (status === "success") summary.success += 1;
+    else if (status === "index_pending") summary.indexPending += 1;
+    else summary.uncertain += 1;
+  }
+  return summary;
+}
+
+async function repairActiveRecycleRows(env, limit) {
+  const rows = await env.DB.prepare(
+    `SELECT deletion_id, memory_key, content_hash FROM memory_recycle_bin
+     WHERE status='active' AND (
+       EXISTS (SELECT 1 FROM memory_chunks WHERE memory_key=memory_recycle_bin.memory_key)
+       OR EXISTS (SELECT 1 FROM memory_index_state WHERE memory_key=memory_recycle_bin.memory_key)
+     ) ORDER BY datetime(deleted_at), deletion_id LIMIT ?`,
+  ).bind(limit).all();
+  const summary = { examined: 0, repaired: 0, blocked: 0 };
+  for (const row of rows.results || []) {
+    summary.examined += 1;
+    let lockId = null;
+    try {
+      lockId = await acquireKeyMutationLock(env.DB, row.memory_key);
+      const value = await env.MEMORY.get(row.memory_key);
+      if (value !== null && await sha256Hex(value) !== row.content_hash) throw new Error("recycle hash mismatch");
+      await purgeIndexForKey(row.memory_key, env);
+      summary.repaired += 1;
+    } catch {
+      summary.blocked += 1;
+    } finally {
+      if (lockId) await releaseKeyMutationLock(env.DB, row.memory_key, lockId);
+    }
+  }
+  return summary;
+}
+
+async function purgeRecycleRow(env, deletionId, key) {
+  const lockId = await acquireKeyMutationLock(env.DB, key);
+  let operationId = null;
+  try {
+    const row = await env.DB.prepare(
+      `SELECT deletion_id, memory_key, space_id, content_hash FROM memory_recycle_bin
+       WHERE deletion_id=? AND memory_key=? AND status='active'`,
+    ).bind(deletionId, key).first();
+    if (!row) throw new Error("active recycle record not found");
+    const value = await env.MEMORY.get(key);
+    if (value !== null && await sha256Hex(value) !== row.content_hash) throw new Error("recycle hash mismatch");
+    operationId = await beginMutationAudit(
+      env,
+      { clientId: null, kind: "admin-purge" },
+      "permanent_purge",
+      key,
+      row.space_id,
+      { deletionId, contentHash: row.content_hash },
+    );
+    await purgeIndexForKey(key, env);
+    if (value !== null) await env.MEMORY.delete(key);
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE memory_recycle_bin SET status='purged', purged_at=CURRENT_TIMESTAMP WHERE deletion_id=? AND status='active'",
+      ).bind(deletionId),
+      env.DB.prepare(
+        "UPDATE memory_mutation_audit SET status='success', completed_at=CURRENT_TIMESTAMP WHERE operation_id=? AND status='pending'",
+      ).bind(operationId),
+    ]);
+    return { key, deletionId, purged: true };
+  } catch (error) {
+    if (operationId) await finishMutationAudit(env, operationId, "uncertain", errorClass(error));
+    throw error;
+  } finally {
+    await releaseKeyMutationLock(env.DB, key, lockId);
+  }
+}
+
+function normalizeOptionalDateTime(value, field) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+    throw new Error(`${field} must be a valid ISO timestamp`);
+  }
+  return new Date(value).toISOString();
+}
+
+function errorClass(error) {
+  const name = error instanceof Error ? error.name : "Error";
+  return String(name || "Error").slice(0, 80);
 }
 
 async function replaceD1Chunks(db, key, meta, contentHash, ids, chunks, spaceId = null) {
@@ -1383,6 +1996,11 @@ function recallEnabled(env) {
     && String(env.V9_RECALL_ENABLED || "false").toLowerCase() === V9_RECALL_FLAG;
 }
 
+function infraEnabled(env) {
+  return authMode(env) === V9_MODE_SHADOW
+    && String(env.V9_INFRA_ENABLED || "false").toLowerCase() === V9_INFRA_FLAG;
+}
+
 function legacyAuthContext(kind = "legacy-bearer") {
   return { legacy: true, kind, clientId: null, grants: [] };
 }
@@ -1393,13 +2011,41 @@ async function authenticateMcpRequest(request, env) {
   const header = request.headers.get("Authorization") || "";
   const match = header.match(/^Bearer\s+(.+)$/i);
   if (!match || match[1].length < MIN_BEARER_TOKEN_LENGTH) return null;
-  const tokenHash = await sha256Hex(match[1]);
-  const client = await env.DB.prepare(
-    `SELECT client_id, client_name FROM api_clients
-     WHERE token_hash = ? AND revoked_at IS NULL
-       AND (expires_at IS NULL OR datetime(expires_at) > CURRENT_TIMESTAMP)`,
-  ).bind(tokenHash).first();
+  return authenticateIsolatedToken(match[1], env, "isolated-bearer", false);
+}
+
+function urlPathToken(pathname) {
+  const match = pathname.match(/^\/mcp\/([A-Za-z0-9_-]+)$/);
+  return match ? match[1] : null;
+}
+
+async function authenticateUrlRequest(token, env) {
+  if (isAuthorizedUrlPath(`/mcp/${token}`, urlToken(env))) return legacyAuthContext("legacy-url");
+  if (!infraEnabled(env) || !token || token.length < MIN_BEARER_TOKEN_LENGTH) return null;
+  return authenticateIsolatedToken(token, env, "isolated-url", true);
+}
+
+async function authenticateIsolatedToken(token, env, kind, requireUrlAllowed) {
+  const tokenHash = await sha256Hex(token);
+  const useInfra = infraEnabled(env);
+  const client = useInfra
+    ? await env.DB.prepare(
+      `SELECT c.client_id, c.client_name,
+              COALESCE(p.borrow_enabled, 0) AS borrow_enabled,
+              COALESCE(p.borrow_daily_limit, 20) AS borrow_daily_limit,
+              COALESCE(p.isolated_url_auth_enabled, 0) AS isolated_url_auth_enabled
+       FROM api_clients c LEFT JOIN api_client_policies p ON p.client_id=c.client_id
+       WHERE c.token_hash = ? AND c.revoked_at IS NULL
+         AND (c.expires_at IS NULL OR datetime(c.expires_at) > CURRENT_TIMESTAMP)`,
+    ).bind(tokenHash).first()
+    : await env.DB.prepare(
+      `SELECT client_id, client_name
+       FROM api_clients
+       WHERE token_hash = ? AND revoked_at IS NULL
+         AND (expires_at IS NULL OR datetime(expires_at) > CURRENT_TIMESTAMP)`,
+    ).bind(tokenHash).first();
   if (!client) return null;
+  if (requireUrlAllowed && Number(client.isolated_url_auth_enabled) !== 1) return null;
   const rows = await env.DB.prepare(
     `SELECT g.space_id, s.space_key, g.capability
      FROM api_client_space_grants g
@@ -1407,23 +2053,39 @@ async function authenticateMcpRequest(request, env) {
      WHERE g.client_id = ? AND g.revoked_at IS NULL AND s.disabled_at IS NULL
        AND (g.expires_at IS NULL OR datetime(g.expires_at) > CURRENT_TIMESTAMP)`,
   ).bind(client.client_id).all();
+  const borrowRows = useInfra && Number(client.borrow_enabled) === 1
+    ? await env.DB.prepare(
+      `SELECT b.target_space_id AS space_id, s.space_key
+       FROM api_client_borrow_spaces b JOIN memory_spaces s ON s.space_id=b.target_space_id
+       WHERE b.client_id=? AND b.revoked_at IS NULL AND s.disabled_at IS NULL
+         AND (b.expires_at IS NULL OR datetime(b.expires_at) > CURRENT_TIMESTAMP)`,
+    ).bind(client.client_id).all()
+    : { results: [] };
   return {
     legacy: false,
-    kind: "isolated-bearer",
+    kind,
     clientId: client.client_id,
     clientName: client.client_name,
     grants: rows.results || [],
+    borrowEnabled: useInfra && Number(client.borrow_enabled) === 1,
+    borrowDailyLimit: Number(client.borrow_daily_limit || 20),
+    borrowSpaces: borrowRows.results || [],
   };
 }
 
 function visibleTools(auth, env) {
-  if (auth.legacy) return TOOLS.filter((tool) => !tool.v9Only).map(stripInternalToolFields);
+  if (auth.legacy) return TOOLS.filter((tool) => !tool.v9Only && !tool.v9InfraOnly).map(stripInternalToolFields);
   return TOOLS.filter((tool) => {
     if (tool.v9Only && !recallEnabled(env)) return false;
+    if (tool.v9InfraOnly && !infraEnabled(env)) return false;
+    if (tool.name === "borrow_memory") return auth.borrowEnabled && (auth.borrowSpaces || []).length > 0;
     const capability = TOOL_CAPABILITIES[tool.name];
     return capability && grantedSpaceIds(auth, capability).length > 0;
   }).map((tool) => {
     const clean = stripInternalToolFields(tool);
+    if (clean.name === "delete_memory" && infraEnabled(env)) {
+      clean.description = "Soft-delete one key into a recoverable recycle record when confirmKey exactly matches key.";
+    }
     if (!new Set(["save_memory", "save_daily"]).has(clean.name)) return clean;
     return {
       ...clean,
@@ -1440,7 +2102,7 @@ function visibleTools(auth, env) {
   });
 }
 
-function stripInternalToolFields({ v9Only, ...tool }) {
+function stripInternalToolFields({ v9Only, v9InfraOnly, ...tool }) {
   return tool;
 }
 
@@ -1448,10 +2110,15 @@ function assertToolAuthorized(auth, toolName, env) {
   const tool = TOOLS.find(({ name }) => name === toolName);
   if (!tool) throw new Error(`Unknown tool: ${toolName}`);
   if (auth.legacy) {
-    if (tool.v9Only) throw new Error("tool is unavailable on the legacy channel");
+    if (tool.v9Only || tool.v9InfraOnly) throw new Error("tool is unavailable on the legacy channel");
     return;
   }
   if (tool.v9Only && !recallEnabled(env)) throw new Error("recall tools are disabled");
+  if (tool.v9InfraOnly && !infraEnabled(env)) throw new Error("infrastructure tools are disabled");
+  if (toolName === "borrow_memory") {
+    if (!auth.borrowEnabled || !(auth.borrowSpaces || []).length) throw new Error("borrow is not enabled");
+    return;
+  }
   const capability = TOOL_CAPABILITIES[toolName];
   if (!capability || !grantedSpaceIds(auth, capability).length) {
     throw new Error("client is not authorized for this tool");

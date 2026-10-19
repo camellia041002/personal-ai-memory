@@ -112,7 +112,7 @@ https://你的项目名.你的子域名.workers.dev/mcp/你的MEMORY_TOKEN
 
 V8 现在有独立的 Deploy to Cloudflare 按钮，代码入口就是 [`v8`](v8)。受 Cloudflare 当前部署页限制，它还需要额外填写 Vectorize 的 `1024` 和 `cosine` 两个固定值。该按钮已通过本地配置检查和 dry-run，但尚未完成全新资源的端到端测试。详细资源和操作说明见[进阶版本](docs/ADVANCED.md)。
 
-仓库中另有一份尚未部署的 [V9 第一阶段本地实现说明](docs/V9_LOCAL_IMPLEMENTATION.md)，用于测试独立客户端、access space 和只读候选召回。它当前只在本地开发分支通过合成数据测试，不代表公开版本或生产环境已经启用。
+仓库中另有一份尚未发布的 [V9 第一阶段实现说明](docs/V9_LOCAL_IMPLEMENTATION.md)。V9-Infra 的通用能力已在独立公开功能分支通过合成测试，但尚未合并、发布或部署；V9.1 召回仍是后续独立模块。版本与模块边界见 [版本管理](docs/VERSIONING.md)。
 
 ## 从 Lite 升级到 V8
 

@@ -1,6 +1,6 @@
-# V9 第一阶段本地实现说明
+# V9 第一阶段实现说明
 
-> 当前状态：仅完成本地实现和合成数据测试，尚未迁移生产数据库、回填真实 key、部署或启用生产流量。
+> 当前状态：V9-Infra 已形成通过公开检查的独立功能分支，尚未合并、发布或部署；V9.1 召回仍属于后续独立模块。Infra 生命周期扩展见 [V9_INFRA.md](V9_INFRA.md)。
 
 V9 第一阶段在 V8 的 KV 原文、D1 chunk 和 Vectorize 索引之上增加独立客户端与 access space。`owner` 仍然只是由 key 推导的语义元数据，不作为权限边界；权限由 `client_id`、space grant 和 capability 共同决定。
 
@@ -12,6 +12,8 @@ V9 第一阶段在 V8 的 KV 原文、D1 chunk 和 Vectorize 索引之上增加�
 - `V9_AUTH_MODE=shadow`：旧 `MEMORY_TOKEN` Bearer 与秘密 URL 继续保持完整 V8 行为；独立客户端 Token 才执行 space 隔离。
 - `V9_RECALL_ENABLED=false`：独立客户端不暴露 `recall_memory` 与 `report_recall_feedback`。
 - `V9_RECALL_ENABLED=true`：在 `shadow` 下为具有 `recall` grant 的独立客户端开放两个工具。
+- `V9_INFRA_ENABLED=false`：保持此前 V9 基线行为，不查询 Infra 新表。
+- `V9_INFRA_ENABLED=true`：在 `shadow` 下开放通用软删除/恢复、元数据回收站、借阅策略与审计基础；启用前必须先应用 `0003_v9_infra.sql`。
 
 本阶段没有实现 `enforce`。独立 Token 不代表旧共享 Token 已被隔离；旧通道仍是兼容通道。
 

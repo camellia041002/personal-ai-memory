@@ -80,16 +80,18 @@ function matchesFilter(metadata, filter = {}) {
   return true;
 }
 
-async function makeSystem() {
+async function makeSystem({ infra = false } = {}) {
   const database = new DatabaseSync(":memory:");
   database.exec("PRAGMA foreign_keys = ON");
   database.exec(await readFile(new URL("../migrations/0001_schema.sql", import.meta.url), "utf8"));
   database.exec(await readFile(new URL("../migrations/0002_v9_access_spaces.sql", import.meta.url), "utf8"));
+  if (infra) database.exec(await readFile(new URL("../migrations/0003_v9_infra.sql", import.meta.url), "utf8"));
   const env = {
     MEMORY_TOKEN: legacyToken,
     ADMIN_TOKEN: adminToken,
     V9_AUTH_MODE: "shadow",
     V9_RECALL_ENABLED: "true",
+    V9_INFRA_ENABLED: infra ? "true" : "false",
     MEMORY: new MemoryKv(),
     DB: new D1Database(database),
     AI: { async run(_model, { text }) { return { data: text.map(() => [0.25, 0.5]) }; } },
@@ -165,6 +167,25 @@ test("V9 migration is additive and preserves V8 rows", async () => {
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM memory_index_state").get().count, 1);
   assert.ok(database.prepare("SELECT space_id FROM memory_index_state WHERE memory_key = ?").get("project_sample"));
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM memory_spaces").get().count, 3);
+  assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+});
+
+test("V9 infrastructure migration is additive and preserves earlier rows", async () => {
+  const database = new DatabaseSync(":memory:");
+  const migrations = await Promise.all([
+    "0001_schema.sql", "0002_v9_access_spaces.sql", "0003_v9_infra.sql",
+  ].map((name) => readFile(new URL(`../migrations/${name}`, import.meta.url), "utf8")));
+  database.exec(migrations[0]);
+  database.exec(migrations[1]);
+  database.prepare(
+    `INSERT INTO memory_index_state
+     (memory_key, category, owner, vector_ids_json, index_version, status, space_id)
+     VALUES (?, ?, ?, '[]', ?, 'ok', ?)`,
+  ).run("project_preserved", "project", "none", "v8-public-qwen3-embedding-0.6b", "legacy-unclassified");
+  assert.doesNotMatch(migrations[2], /^\s*(?:DROP|DELETE)\b/im);
+  database.exec(migrations[2]);
+  assert.equal(database.prepare("SELECT COUNT(*) AS count FROM memory_index_state").get().count, 1);
+  assert.equal(database.prepare("SELECT COUNT(*) AS count FROM api_client_policies").get().count, 0);
   assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
 });
 
@@ -734,6 +755,165 @@ test("V9 admin mutations require ADMIN_TOKEN, confirmations, and bounded identif
   ]);
   assert.equal(combined.includes("token_hash"), false);
   assert.equal(combined.includes(client.token), false);
+});
+
+test("V9 infrastructure soft delete is hidden, metadata-only, and restorable", async () => {
+  const { database, env } = await makeSystem({ infra: true });
+  await createSpace(env, "private:alpha");
+  const alpha = await createClient(env, "Alpha", "private:alpha");
+  const body = "synthetic body that must never appear in recycle metadata";
+  await tool(env, alpha.token, "save_memory", {
+    key: "project_recycle_sample", value: body, spaceKey: "private:alpha",
+  });
+  const deleted = await tool(env, alpha.token, "delete_memory", {
+    key: "project_recycle_sample", confirmKey: "project_recycle_sample",
+  });
+  assert.equal(deleted.recycled, true);
+  assert.equal(await env.MEMORY.get("project_recycle_sample"), body);
+  assert.equal(await tool(env, alpha.token, "get_memory", { key: "project_recycle_sample" }), "Not found: project_recycle_sample");
+  const listed = await tool(env, alpha.token, "list_recycle_bin", { status: "active" });
+  assert.equal(listed.count, 1);
+  assert.equal(listed.results[0].deletionId, deleted.deletionId);
+  assert.equal(JSON.stringify(listed).includes(body), false);
+  assert.equal(JSON.stringify(listed).includes(alpha.clientId), false);
+  const restored = await tool(env, alpha.token, "restore_memory", {
+    key: "project_recycle_sample", deletionId: deleted.deletionId, confirmKey: "project_recycle_sample",
+  });
+  assert.equal(restored.restored, true);
+  assert.equal(await tool(env, alpha.token, "get_memory", { key: "project_recycle_sample" }), body);
+  assert.equal(database.prepare("SELECT status FROM memory_recycle_bin WHERE deletion_id=?").get(deleted.deletionId).status, "restored");
+  assert.equal(database.prepare("SELECT COUNT(*) AS count FROM memory_mutation_audit WHERE status='pending'").get().count, 0);
+});
+
+test("V9 infrastructure borrow requires policy and a target-space allowlist", async () => {
+  const { database, env } = await makeSystem({ infra: true });
+  await createSpace(env, "private:alpha");
+  await createSpace(env, "private:beta");
+  await createSpace(env, "private:gamma");
+  const alpha = await createClient(env, "Alpha", "private:alpha", ["read"]);
+  const beta = await createClient(env, "Beta", "private:beta");
+  await tool(env, beta.token, "save_memory", {
+    key: "project_borrow_sample", value: "synthetic borrowed context", spaceKey: "private:beta",
+  });
+  assert.equal((await rpc(env, alpha.token, "tools/list")).result.tools.some(({ name }) => name === "borrow_memory"), false);
+  await admin(env, "/admin/v9/client-policy/set", {
+    clientId: alpha.clientId, borrowEnabled: true, borrowDailyLimit: 2,
+    isolatedUrlAuthEnabled: false, confirmPolicy: `${alpha.clientId}:true:2:false`,
+  });
+  await admin(env, "/admin/v9/borrow-spaces/grant", {
+    clientId: alpha.clientId, spaceKey: "private:beta",
+    confirmBorrowGrant: `${alpha.clientId}:private:beta`,
+  });
+  await admin(env, "/admin/v9/borrow-spaces/grant", {
+    clientId: alpha.clientId, spaceKey: "private:gamma",
+    confirmBorrowGrant: `${alpha.clientId}:private:gamma`,
+  });
+  assert.equal((await rpc(env, alpha.token, "tools/list")).result.tools.some(({ name }) => name === "borrow_memory"), true);
+  const borrowed = await tool(env, alpha.token, "borrow_memory", {
+    targetSpace: "private:beta", key: "project_borrow_sample",
+  });
+  assert.equal(borrowed.results[0].value, "synthetic borrowed context");
+  await tool(env, alpha.token, "borrow_memory", {
+    targetSpace: "private:beta", key: "project_borrow_sample",
+  });
+  assert.match(JSON.stringify(await tool(env, alpha.token, "borrow_memory", {
+    targetSpace: "private:gamma", key: "project_missing_in_gamma",
+  })), /daily borrow limit reached/);
+  assert.equal(database.prepare("SELECT status FROM memory_borrow_audit").get().status, "success");
+});
+
+test("V9 infrastructure isolated URL authentication is opt-in per client", async () => {
+  const { env } = await makeSystem({ infra: true });
+  await createSpace(env, "private:alpha");
+  const alpha = await createClient(env, "Alpha", "private:alpha", ["read"]);
+  const request = () => worker.fetch(new Request(`https://example.invalid/mcp/${alpha.token}`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+  }), env);
+  assert.equal((await request()).status, 401);
+  await admin(env, "/admin/v9/client-policy/set", {
+    clientId: alpha.clientId, borrowEnabled: false, borrowDailyLimit: 20,
+    isolatedUrlAuthEnabled: true, confirmPolicy: `${alpha.clientId}:false:20:true`,
+  });
+  assert.equal((await request()).status, 200);
+});
+
+test("V9 infrastructure preserves legacy delete and releases purged keys", async () => {
+  const { env } = await makeSystem({ infra: true });
+  await env.MEMORY.put("project_legacy_unmapped", "synthetic legacy value");
+  assert.equal((await tool(env, legacyToken, "delete_memory", {
+    key: "project_legacy_unmapped", confirmKey: "project_legacy_unmapped",
+  })).deleted, true);
+  assert.equal(await env.MEMORY.get("project_legacy_unmapped"), null);
+
+  await createSpace(env, "private:alpha");
+  await createSpace(env, "private:beta");
+  const alpha = await createClient(env, "Alpha", "private:alpha");
+  await tool(env, alpha.token, "save_memory", {
+    key: "project_reusable", value: "synthetic value", spaceKey: "private:alpha",
+  });
+  const deleted = await tool(env, alpha.token, "delete_memory", {
+    key: "project_reusable", confirmKey: "project_reusable",
+  });
+  assert.match(JSON.stringify(await tool(env, legacyToken, "delete_memory", {
+    key: "project_reusable", confirmKey: "project_reusable",
+  })), /active recycle records require restore or explicit administrator purge/);
+  assert.equal(await env.MEMORY.get("project_reusable"), "synthetic value");
+  const reassign = await admin(env, "/admin/v9/key-space/assign", {
+    key: "project_reusable", spaceKey: "private:beta", confirmKey: "project_reusable",
+    confirmFromSpaceKey: "private:alpha",
+  });
+  assert.equal(reassign.response.status, 500);
+  const purged = await admin(env, "/admin/v9/recycle/purge-one", {
+    deletionId: deleted.deletionId, key: "project_reusable",
+    confirmPurge: `${deleted.deletionId}:project_reusable:PERMANENT`,
+  });
+  assert.equal(purged.payload.purged, true);
+  assert.equal((await tool(env, alpha.token, "save_memory", {
+    key: "project_reusable", value: "synthetic replacement", spaceKey: "private:alpha",
+  })).kv, "ok");
+});
+
+test("V9 infrastructure daily conflicts ignore actively recycled entries", async () => {
+  const { env } = await makeSystem({ infra: true });
+  await createSpace(env, "private:alpha");
+  const alpha = await createClient(env, "Alpha", "private:alpha");
+  const first = await tool(env, alpha.token, "save_daily", {
+    owner: "sample", date: "2026-10-20", note: "old", value: "synthetic old", spaceKey: "private:alpha",
+  });
+  await tool(env, alpha.token, "delete_memory", { key: first.key, confirmKey: first.key });
+  assert.match(JSON.stringify(await tool(env, alpha.token, "save_daily", {
+    owner: "sample", date: "2026-10-20", note: "old", value: "synthetic duplicate", spaceKey: "private:alpha",
+  })), /entry already exists/);
+  const replacement = await tool(env, alpha.token, "save_daily", {
+    owner: "sample", date: "2026-10-20", note: "new", value: "synthetic new", spaceKey: "private:alpha",
+  });
+  assert.equal(replacement.kv, "ok");
+  assert.equal(replacement.key, "sample_daily_2026-10-20_new");
+});
+
+test("V9 infrastructure reconciliation accepts intentionally skipped indexes", async () => {
+  const { database, env } = await makeSystem({ infra: true });
+  await createSpace(env, "private:alpha");
+  const alpha = await createClient(env, "Alpha", "private:alpha");
+  await tool(env, alpha.token, "save_memory", {
+    key: "archive_sample", value: "synthetic archive", spaceKey: "private:alpha",
+  });
+  const state = database.prepare(
+    "SELECT content_hash, space_id FROM memory_index_state WHERE memory_key='archive_sample'",
+  ).get();
+  database.prepare(
+    `INSERT INTO memory_mutation_audit
+     (operation_id, client_id, auth_kind, action, memory_key, space_id, content_hash, status, started_at)
+     VALUES ('synthetic-pending', ?, 'isolated-bearer', 'create', 'archive_sample', ?, ?, 'pending', datetime('now','-20 minutes'))`,
+  ).run(alpha.clientId, state.space_id, state.content_hash);
+  const reconciled = await admin(env, "/admin/v9/audit/reconcile-pending", {
+    confirmReconcile: true,
+  });
+  assert.equal(reconciled.payload.success, 1);
+  assert.equal(database.prepare(
+    "SELECT status FROM memory_mutation_audit WHERE operation_id='synthetic-pending'",
+  ).get().status, "success");
 });
 
 function interceptDb(delegate, predicate, message) {
