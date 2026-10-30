@@ -2,6 +2,12 @@
 
 This document describes the generic V9-Infra implementation on `codex/v9-infra`. It is a verified public feature branch, not a release or deployment guide.
 
+## 中文摘要
+
+V9-Infra 的目标是让不同 AI 使用独立 client Token，并只访问得到 grant 的 access space。当前分支还不能作为正式版本部署：它只提供兼容模式 `shadow`，旧钥匙仍保留 V8 全库能力；独立客户端才执行分区授权。
+
+这个分支包含默认关闭的服务端基础召回工具，AI 需要主动调用。每轮对话前自动检索和注入旧内容的客户端 Hook 或 gateway 仍在调试，尚未放进仓库，计划随完整 V9 一起公开。V9 完成后计划合并进 `main` 并替代 V8；当前不设承诺日期。软删除只适用于已有显式 space 映射的独立客户端；旧钥匙的删除仍是永久删除。面向普通用户的说明、术语和完整接口清单见 [V9 第一阶段实现说明](V9_LOCAL_IMPLEMENTATION.md)。
+
 ## Scope
 
 With `V9_AUTH_MODE=shadow` and `V9_INFRA_ENABLED=true`, isolated clients can use access-space grants and generic lifecycle controls:
@@ -19,9 +25,9 @@ Isolated URL authentication is default-off per client and requires both the Infr
 
 ## Data and migration
 
-`migrations/0003_v9_infra.sql` is additive and follows the public `0002` baseline. It creates generic policy, borrow-scope, recycle, audit, and aggregate-observation tables. It does not replay any private migration history and contains no private client roles or production identifiers.
+`migrations/0003_v9_infra.sql` is additive and follows the public `0002` baseline. It creates generic policy, borrow-scope, recycle, audit, and aggregate-observation tables. It does not replay environment-specific migration history and contains no deployment-specific client roles or resource identifiers.
 
-The feature flag must remain off until the migration is applied. With `V9_INFRA_ENABLED=false`, the Worker uses the earlier V9 authentication query and does not require the new tables, preserving the existing V8/V9-baseline contract.
+The feature flag must remain off until the migration is applied. With `V9_INFRA_ENABLED=false`, the Worker uses the earlier V9 authentication query and does not require the new tables, preserving the existing V8/V9-baseline contract. The V8 deploy script applies every bundled migration, including `0002` and `0003`; creating those tables does not enable V9 while all V9 flags remain off.
 
 ## Consistency boundary
 
@@ -33,8 +39,8 @@ KV, D1, and Vectorize do not provide a shared transaction. The implementation th
 4. D1 records success only after the required derived work completes.
 5. Pending reconciliation and recycle repair classify or repair interrupted work.
 
-This prevents a half-restored key from becoming visible, but it is not distributed atomicity. Operators must keep the explicit repair and exact purge procedures available.
+This prevents a half-restored key from becoming visible, but it is not distributed atomicity. Administrators must use the explicit repair or exact purge endpoint when an interrupted operation needs attention.
 
 ## Deliberate exclusions
 
-This branch does not include private identities, production configuration, credentials, deployment bindings, real memory data, automatic retention purge, V9.1 recall tuning, V9.2 surfacing, or V9.3 installation and release packaging.
+This branch does not include deployment-specific identities or configuration, credentials, resource bindings, real memory data, or automatic retention purge. Client-side per-turn recall and injection, V9.2 surfacing, and V9.3 installation and release packaging are not yet in the repository; they remain under development for the complete V9 release path.

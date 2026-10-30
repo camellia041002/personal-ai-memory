@@ -15,6 +15,8 @@ V8 是带混合搜索和索引恢复能力的完整版本。它仍是一个部�
 
 部署命令会自动执行 D1 migration，并请求创建 `cat`、`owner`、`date`、`space` 四个 Vectorize metadata index。`space` 为默认关闭的 V9 shadow 功能预留；V8 默认行为不依赖它。Cloudflare 的 metadata index 创建是异步的；部署后应等它们在控制台中显示，再测试带筛选的语义搜索。
 
+当前构建会把根目录中的全部 migration 复制到 `v8/migrations`，所以部署 V8 时也会创建默认关闭的 V9 access-space 和 lifecycle 表。创建这些空表不会启用 V9：模板中的 `V9_AUTH_MODE=off`、`V9_INFRA_ENABLED=false` 和 `V9_RECALL_ENABLED=false` 会继续保持 V8 行为。这个 V9 分支尚未准备好作为正式部署版本；合并前必须重新核对迁移、升级和回退说明。
+
 连接方式与 Lite 相同：
 
 ```text

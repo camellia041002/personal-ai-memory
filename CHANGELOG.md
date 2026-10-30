@@ -5,7 +5,7 @@
 ## Unreleased
 
 - 将项目定位改为不绑定单一 AI 的外置 MCP 记忆系统：一个 AI 可独立使用，多个客户端可选共用，并说明 key 前缀是分类而不是权限隔离。
-- 新增独立 `v8` Deploy to Cloudflare 包，声明自动创建 KV、D1、Vectorize、Workers AI，部署时执行 D1 migration 并请求建立三项 metadata indexes。
+- 新增独立 `v8` Deploy to Cloudflare 包，声明自动创建 KV、D1、Vectorize、Workers AI，部署时执行 D1 migration 并请求建立四项 metadata indexes。
 - 新 V8 部署使用同一个 `MEMORY_TOKEN` 支持 Bearer 与单 URL，管理员接口继续使用独立的 `ADMIN_TOKEN`；旧 `AUTH_TOKEN` / `MCP_URL_TOKEN` 配置保持兼容。
 - README 增加基于 Cloudflare 当前 1 GB KV 免费存储的条数估算，并列明每日请求、读取、写入和列表额度。
 - 新增首页默认 Lite：独立的 `lite` 一键部署目录、自动 KV provisioning、单一普通权限 `MEMORY_TOKEN` 和 `workers.dev` 落地页。
@@ -16,6 +16,8 @@
 - `MCP_URL_TOKEN` 只从 Cloudflare Secret 读取；未配置、格式无效、路径错误或多余层级均返回 `404`，且不能访问 `/admin/*`。
 - 将配置检查拆分为“模板结构有效”和“实际配置可部署”，实际模式拒绝占位符、空 ID 和明显无效的资源标识。
 - 重排 README 的首次部署流程，增加客户端连接说明、跨平台 Token 生成、metadata index 确认、示例导入和部署后 smoke test。
+- V9-Infra 开发分支新增 access space、独立客户端 grant、默认关闭的基础召回工具、软删除与恢复、元数据回收站、受限借阅和审计；客户端侧每轮自动召回与注入仍在调试，计划随完整 V9 一起公开，完成后由 V9 在 `main` 替代 V8。
+- V9-Infra 配置模板显式加入默认关闭的 `V9_INFRA_ENABLED=false`；V8 构建会复制 V9 migration，但默认开关关闭时仍保持 V8 请求行为。
 
 ## V8 — 2026-09-04
 

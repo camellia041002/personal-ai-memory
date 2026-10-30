@@ -51,9 +51,9 @@ D1 精确短语查询与 Workers AI/Vectorize 语义查询并行运行。Vectori
 
 普通 MCP Token 不能调用 `/admin/*`。管理员 Token 可分页查看 key、查询索引状态，并逐 key 重建。游标分页与逐 key 重建可以由受控脚本组合为分批恢复流程；公开版不内置自动全库遍历或计划任务。
 
-## V9 shadow path（本地开发）
+## V9 access-space path（开发中的公开分支）
 
-V9 第一阶段不建立第二套正文或向量库，也不修改 V8 的切片和 vector identity。它在现有派生索引上增加 key-to-space 映射、独立 client grant、召回事件与反馈记录：
+V9 第一阶段不建立第二套正文或向量库，也不修改 V8 的切片和 vector identity。它在现有派生索引上增加 key-to-space 映射、独立 client grant、召回事件与反馈记录。当前只提供兼容模式 `shadow`：旧钥匙继续走 V8 全库通道，只有独立客户端才按 access space 隔离，因此它不是全局强制隔离模式。
 
 ```mermaid
 flowchart LR
@@ -67,4 +67,4 @@ flowchart LR
     W --> E[(recall events and feedback)]
 ```
 
-没有显式映射的旧 key 在授权判断中视为 `legacy-unclassified`。Vectorize metadata 是候选过滤的第一层，D1 与 `memory_key_spaces` 的当前映射是返回前的最终校验，因此陈旧向量 metadata 不会放宽权限，只可能暂时减少语义命中。完整行为和生产前回填计划见 [V9 第一阶段本地实现说明](docs/V9_LOCAL_IMPLEMENTATION.md)。
+没有显式映射的旧 key 在授权判断中视为 `legacy-unclassified`。Vectorize metadata 是候选过滤的第一层，D1 与 `memory_key_spaces` 的当前映射是返回前的最终校验，因此陈旧向量 metadata 不会放宽权限，只可能暂时减少语义命中。完整行为和启用步骤见 [V9 第一阶段实现说明](docs/V9_LOCAL_IMPLEMENTATION.md)。

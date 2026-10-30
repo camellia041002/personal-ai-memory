@@ -43,11 +43,13 @@ Lite 和新的 `v8` 一键部署包都使用一个 `MEMORY_TOKEN` 作为普通�
 
 管理员权限可以分页查看 key、查看索引状态并逐 key 重建。管理员 Token 的泄露影响范围更大，不应配置到普通 MCP 客户端。删除仍位于普通工具集中，是为了保持 V8 的使用方式，但必须提供与目标 key 完全一致的 `confirmKey`。
 
-### V9 shadow access spaces
+### V9 development branch access spaces
 
-本地开发中的 V9 第一阶段把 `owner` 与授权边界分开：`owner` 只用于内容语义和筛选，真正的边界是服务端保存的 access space、client 与 capability grant。独立客户端 Token 只以 SHA-256 哈希保存；`tools/list` 负责减少误用，`tools/call` 仍是最终安全边界。已知完整 key、伪造 `owner` / `category` / `spaceKey` 或直接调用未列出的工具，都不能绕过服务端映射与 grant。
+开发中的 V9 公开分支把 `owner` 与授权边界分开：`owner` 只用于内容语义和筛选，真正的边界是服务端保存的 access space、client 与 capability grant。独立客户端 Token 只以 SHA-256 哈希保存；`tools/list` 负责减少误用，`tools/call` 仍是最终安全边界。已知完整 key、伪造 `owner` / `category` / `spaceKey` 或直接调用未列出的工具，都不能绕过服务端映射与 grant。
 
-`shadow` 是兼容模式，不是全局隔离模式。旧共享 Bearer 和秘密 URL 继续拥有完整 V8 权限；只有独立 Bearer client 执行 space 隔离。因此，给客户端签发独立 Token 并不等于旧 `MEMORY_TOKEN` 已失去全库能力。当前没有 `enforce`，也没有面向互不信任租户的安全承诺。详见 [V9 第一阶段本地实现说明](docs/V9_LOCAL_IMPLEMENTATION.md)。
+兼容模式 `shadow` 不会把旧钥匙自动变成分区钥匙。旧共享 Bearer 和秘密 URL 仍能按 V8 规则访问全库，并且 `delete_memory` 仍是彻底删除，不进入回收站；但它不能列出或恢复回收站记录、借阅其他 space、使用基础召回工具，也不能删除已经处于回收站中的 key。独立客户端只有在 key 已有显式 access-space 映射且具有 `delete` grant 时才能软删除；`legacy-unclassified` key 必须先由管理员明确归属。
+
+因此，给客户端签发独立 Token 并不等于旧 `MEMORY_TOKEN` 已失去全库能力。当前没有 `enforce` 模式，也没有面向互不信任租户的安全承诺。详见 [V9 第一阶段实现说明](docs/V9_LOCAL_IMPLEMENTATION.md)。
 
 ## Limits and abuse controls
 
