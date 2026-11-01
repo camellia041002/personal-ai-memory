@@ -58,8 +58,11 @@ class MemoryKv {
 }
 
 class VectorIndex {
-  constructor() { this.vectors = new Map(); this.failQuery = false; }
-  async upsert(vectors) { for (const vector of vectors) this.vectors.set(vector.id, vector); }
+  constructor() { this.vectors = new Map(); this.failQuery = false; this.failUpsert = false; }
+  async upsert(vectors) {
+    if (this.failUpsert) throw new Error("synthetic upsert failure");
+    for (const vector of vectors) this.vectors.set(vector.id, vector);
+  }
   async deleteByIds(ids) { for (const id of ids) this.vectors.delete(id); }
   async query(_embedding, options) {
     if (this.failQuery) throw new Error("synthetic semantic failure");
@@ -85,7 +88,10 @@ async function makeSystem({ infra = false } = {}) {
   database.exec("PRAGMA foreign_keys = ON");
   database.exec(await readFile(new URL("../migrations/0001_schema.sql", import.meta.url), "utf8"));
   database.exec(await readFile(new URL("../migrations/0002_v9_access_spaces.sql", import.meta.url), "utf8"));
-  if (infra) database.exec(await readFile(new URL("../migrations/0003_v9_infra.sql", import.meta.url), "utf8"));
+  if (infra) {
+    database.exec(await readFile(new URL("../migrations/0003_v9_infra.sql", import.meta.url), "utf8"));
+    database.exec(await readFile(new URL("../migrations/0004_v9_memory_rename.sql", import.meta.url), "utf8"));
+  }
   const env = {
     MEMORY_TOKEN: legacyToken,
     ADMIN_TOKEN: adminToken,
@@ -186,6 +192,22 @@ test("V9 infrastructure migration is additive and preserves earlier rows", async
   database.exec(migrations[2]);
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM memory_index_state").get().count, 1);
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM api_client_policies").get().count, 0);
+  assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+});
+
+test("V9 rename migration is additive, fail-closed, and preserves infrastructure rows", async () => {
+  const database = new DatabaseSync(":memory:");
+  for (const name of ["0001_schema.sql", "0002_v9_access_spaces.sql", "0003_v9_infra.sql"]) {
+    database.exec(await readFile(new URL(`../migrations/${name}`, import.meta.url), "utf8"));
+  }
+  database.prepare(
+    "INSERT INTO memory_spaces (space_id, space_key, space_type, display_name) VALUES (?, ?, ?, ?)",
+  ).run("space-synthetic", "private:synthetic", "private", "Synthetic");
+  const migration = await readFile(new URL("../migrations/0004_v9_memory_rename.sql", import.meta.url), "utf8");
+  assert.doesNotMatch(migration, /^\s*(?:DROP|DELETE)\b/im);
+  database.exec(migration);
+  assert.equal(database.prepare("SELECT protected_keys_ready FROM memory_rename_policy_state").get().protected_keys_ready, 0);
+  assert.ok(database.prepare("SELECT space_id FROM memory_spaces WHERE space_id=?").get("space-synthetic"));
   assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
 });
 
@@ -916,7 +938,215 @@ test("V9 infrastructure reconciliation accepts intentionally skipped indexes", a
   ).get().status, "success");
 });
 
-function interceptDb(delegate, predicate, message) {
+test("rename requires intersecting write and delete grants and preserves body and space", async () => {
+  const { database, env } = await makeSystem({ infra: true });
+  await createSpace(env, "private:synthetic");
+  const full = await createClient(env, "Synthetic full client", "private:synthetic");
+  const writer = await createClient(env, "Synthetic writer", "private:synthetic", ["write"]);
+  await admin(env, "/admin/v9/rename/protection-replace", {
+    sourceVersion: "synthetic-v1",
+    keys: [{ key: "project_continuity", reason: "synthetic continuity fixture" }],
+    confirmReplace: true,
+  });
+  assert.equal((await rpc(env, full.token, "tools/list")).result.tools.some(({ name }) => name === "rename_memory"), true);
+  assert.equal((await rpc(env, writer.token, "tools/list")).result.tools.some(({ name }) => name === "rename_memory"), false);
+  await tool(env, full.token, "save_memory", {
+    key: "project_original", value: "synthetic body", spaceKey: "private:synthetic",
+  });
+  const renamed = await tool(env, full.token, "rename_memory", {
+    key: "project_original", newKey: "project_renamed", confirmKey: "project_original",
+  });
+  assert.equal(renamed.renamed, true);
+  assert.equal(await env.MEMORY.get("project_original"), null);
+  assert.equal(await env.MEMORY.get("project_renamed"), "synthetic body");
+  assert.equal(database.prepare("SELECT status FROM memory_rename_journal WHERE old_key=?").get("project_original").status, "success");
+});
+
+test("rename fails closed for unready policy, protected, lifecycle, and existing target keys", async () => {
+  const { database, env } = await makeSystem({ infra: true });
+  await createSpace(env, "private:synthetic");
+  const client = await createClient(env, "Synthetic guarded client", "private:synthetic");
+  await tool(env, client.token, "save_memory", {
+    key: "project_source", value: "source", spaceKey: "private:synthetic",
+  });
+  assert.match(JSON.stringify(await tool(env, client.token, "rename_memory", {
+    key: "project_source", newKey: "project_target", confirmKey: "project_source",
+  })), /protection list is not ready/);
+  await admin(env, "/admin/v9/rename/protection-replace", {
+    sourceVersion: "synthetic-v1",
+    keys: [{ key: "project_source", reason: "synthetic protected fixture" }],
+    confirmReplace: true,
+  });
+  assert.match(JSON.stringify(await tool(env, client.token, "rename_memory", {
+    key: "project_source", newKey: "project_target", confirmKey: "project_source",
+  })), /protected continuity/);
+  database.prepare("DELETE FROM memory_rename_protected_keys").run();
+  assert.match(JSON.stringify(await tool(env, client.token, "rename_memory", {
+    key: "project_source", newKey: "owner_daily_2026-01-01", confirmKey: "project_source",
+  })), /cannot be renamed/);
+  await tool(env, client.token, "save_memory", {
+    key: "project_existing", value: "occupied", spaceKey: "private:synthetic",
+  });
+  assert.match(JSON.stringify(await tool(env, client.token, "rename_memory", {
+    key: "project_source", newKey: "project_existing", confirmKey: "project_source",
+  })), /already exists/);
+});
+
+test("rename rollback removes its target and unresolved states hide only the non-authoritative name", async () => {
+  const { database, env } = await makeSystem({ infra: true });
+  await createSpace(env, "private:synthetic");
+  const client = await createClient(env, "Synthetic state client", "private:synthetic");
+  await admin(env, "/admin/v9/rename/protection-replace", {
+    sourceVersion: "synthetic-v1", keys: [{ key: "project_guard", reason: "fixture" }], confirmReplace: true,
+  });
+  await tool(env, client.token, "save_memory", {
+    key: "project_rollback", value: "rollback body", spaceKey: "private:synthetic",
+  });
+  env.VECTORIZE_INDEX.failUpsert = true;
+  assert.match(JSON.stringify(await tool(env, client.token, "rename_memory", {
+    key: "project_rollback", newKey: "project_rollback_target", confirmKey: "project_rollback",
+  })), /synthetic upsert failure/);
+  env.VECTORIZE_INDEX.failUpsert = false;
+  assert.equal(await env.MEMORY.get("project_rollback_target"), null);
+  assert.equal(database.prepare("SELECT status FROM memory_rename_journal WHERE old_key=?").get("project_rollback").status, "rolled_back");
+
+  const spaceId = database.prepare("SELECT space_id FROM memory_spaces WHERE space_key='private:synthetic'").get().space_id;
+  database.prepare(
+    `INSERT INTO memory_rename_journal
+     (operation_id, old_key, new_key, space_id, auth_kind, content_hash, status)
+     VALUES (?, ?, ?, ?, 'synthetic', ?, ?)`,
+  ).run("pending-fixture", "project_pending_old", "project_pending_new", spaceId, "a".repeat(64), "pending");
+  await env.MEMORY.put("project_pending_old", "old authoritative");
+  await env.MEMORY.put("project_pending_new", "uncommitted target");
+  assert.equal(await tool(env, legacyToken, "get_memory", { key: "project_pending_old" }), "old authoritative");
+  assert.equal(await tool(env, legacyToken, "get_memory", { key: "project_pending_new" }), "Not found: project_pending_new");
+
+  database.prepare("UPDATE memory_rename_journal SET status='committed' WHERE operation_id='pending-fixture'").run();
+  assert.equal(await tool(env, legacyToken, "get_memory", { key: "project_pending_old" }), "Not found: project_pending_old");
+  assert.equal(await tool(env, legacyToken, "get_memory", { key: "project_pending_new" }), "uncommitted target");
+  assert.match(JSON.stringify(await tool(env, legacyToken, "save_memory", {
+    key: "project_pending_old", value: "blocked",
+  })), /unresolved rename/);
+});
+
+test("rename commit fencing handles changes zero and a lost batch response", async () => {
+  for (const mode of ["changes-zero", "response-lost"]) {
+    const { env } = await makeSystem({ infra: true });
+    await createSpace(env, `private:${mode}`);
+    const client = await createClient(env, `Synthetic ${mode}`, `private:${mode}`);
+    await admin(env, "/admin/v9/rename/protection-replace", {
+      sourceVersion: "synthetic-v1", keys: [{ key: "project_guard", reason: "fixture" }], confirmReplace: true,
+    });
+    const oldKey = `project_${mode}_old`;
+    const newKey = `project_${mode}_new`;
+    await tool(env, client.token, "save_memory", { key: oldKey, value: mode, spaceKey: `private:${mode}` });
+    const delegate = env.DB;
+    if (mode === "changes-zero") {
+      env.DB = interceptDb(delegate, (sql) => sql.includes("SET status='committed'"), "unused", { changesZero: true });
+      assert.match(JSON.stringify(await tool(env, client.token, "rename_memory", {
+        key: oldKey, newKey, confirmKey: oldKey,
+      })), /rename commit did not take effect/);
+      assert.equal(await env.MEMORY.get(oldKey), mode);
+      assert.equal(await env.MEMORY.get(newKey), null);
+    } else {
+      let thrown = false;
+      env.DB = {
+        prepare: (sql) => delegate.prepare(sql),
+        async batch(statements) {
+          const result = await delegate.batch(statements);
+          if (!thrown && statements.some((statement) => statement.sql.includes("SET status='committed'"))) {
+            thrown = true;
+            throw new Error("synthetic response lost");
+          }
+          return result;
+        },
+      };
+      const result = await tool(env, client.token, "rename_memory", { key: oldKey, newKey, confirmKey: oldKey });
+      assert.equal(result.renamed, true);
+      assert.equal(await env.MEMORY.get(oldKey), null);
+      assert.equal(await env.MEMORY.get(newKey), mode);
+    }
+  }
+});
+
+test("rename hidden-key batching stays below D1 bind limits", async () => {
+  const { env } = await makeSystem({ infra: true });
+  for (let index = 0; index < 121; index += 1) await env.MEMORY.put(`project_batch_${index}`, "fixture");
+  const delegate = env.DB;
+  env.DB = {
+    prepare(sql) {
+      const statement = delegate.prepare(sql);
+      return {
+        bind(...values) {
+          if (values.length > 100) throw new Error("synthetic D1 bind limit exceeded");
+          return statement.bind(...values);
+        },
+        all: () => statement.all(), first: (column) => statement.first(column), run: () => statement.run(),
+      };
+    },
+    batch: (statements) => delegate.batch(statements),
+  };
+  const result = await tool(env, legacyToken, "find_memory_keys", { prefix: "project_batch_", limit: 20 });
+  assert.equal(result.count, 20);
+});
+
+test("rename reconciliation repairs stale pre-commit and post-commit cleanup states", async () => {
+  const { database, env } = await makeSystem({ infra: true });
+  await createSpace(env, "private:synthetic");
+  const client = await createClient(env, "Synthetic reconcile client", "private:synthetic");
+  await admin(env, "/admin/v9/rename/protection-replace", {
+    sourceVersion: "synthetic-v1", keys: [{ key: "project_guard", reason: "fixture" }], confirmReplace: true,
+  });
+  const saved = await tool(env, client.token, "save_memory", {
+    key: "project_stale_old", value: "stale body", spaceKey: "private:synthetic",
+  });
+  const spaceId = database.prepare("SELECT space_id FROM memory_spaces WHERE space_key='private:synthetic'").get().space_id;
+  await env.MEMORY.put("project_stale_new", "stale body");
+  database.prepare(
+    `INSERT INTO memory_rename_journal
+     (operation_id, old_key, new_key, space_id, auth_kind, content_hash, status, started_at)
+     VALUES ('stale-fixture', ?, ?, ?, 'synthetic', ?, 'pending', datetime('now','-21 minutes'))`,
+  ).run("project_stale_old", "project_stale_new", spaceId, saved.contentHash);
+  let repaired = await admin(env, "/admin/v9/rename/reconcile", { confirmReconcile: true });
+  assert.equal(repaired.payload.repaired, 1);
+  assert.equal(await env.MEMORY.get("project_stale_new"), null);
+  assert.equal(database.prepare("SELECT status FROM memory_rename_journal WHERE operation_id='stale-fixture'").get().status, "rolled_back");
+
+  const renamed = await tool(env, client.token, "rename_memory", {
+    key: "project_stale_old", newKey: "project_committed_new", confirmKey: "project_stale_old",
+  });
+  assert.equal(renamed.renamed, true);
+  database.prepare(
+    "UPDATE memory_rename_journal SET status='reconcile_required' WHERE new_key='project_committed_new'",
+  ).run();
+  await env.MEMORY.put("project_stale_old", "stale body");
+  repaired = await admin(env, "/admin/v9/rename/reconcile", { confirmReconcile: true });
+  assert.equal(repaired.payload.repaired, 1);
+  assert.equal(await env.MEMORY.get("project_stale_old"), null);
+  assert.equal(await env.MEMORY.get("project_committed_new"), "stale body");
+});
+
+test("rename fails closed when its migration is missing and rejects disabled source spaces", async () => {
+  const missing = await makeSystem({ infra: true });
+  missing.database.exec("DROP TABLE memory_rename_journal");
+  assert.match(JSON.stringify(await tool(missing.env, legacyToken, "get_memory", { key: "project_missing" })), /rename migration/);
+
+  const { database, env } = await makeSystem({ infra: true });
+  await createSpace(env, "private:synthetic");
+  const client = await createClient(env, "Synthetic disabled client", "private:synthetic");
+  await admin(env, "/admin/v9/rename/protection-replace", {
+    sourceVersion: "synthetic-v1", keys: [{ key: "project_guard", reason: "fixture" }], confirmReplace: true,
+  });
+  await tool(env, client.token, "save_memory", {
+    key: "project_disabled", value: "fixture", spaceKey: "private:synthetic",
+  });
+  database.prepare("UPDATE memory_spaces SET disabled_at=CURRENT_TIMESTAMP WHERE space_key='private:synthetic'").run();
+  assert.match(JSON.stringify(await tool(env, legacyToken, "rename_memory", {
+    key: "project_disabled", newKey: "project_disabled_new", confirmKey: "project_disabled",
+  })), /active explicit access-space mapping/);
+});
+
+function interceptDb(delegate, predicate, message, options = {}) {
   return {
     prepare(sql) {
       if (predicate(sql)) {
@@ -925,9 +1155,13 @@ function interceptDb(delegate, predicate, message) {
             return {
               async all() { throw new Error(message); },
               async first() { throw new Error(message); },
-              async run() { throw new Error(message); },
+              async run() {
+                if (options.changesZero) return { success: true, meta: { changes: 0 } };
+                throw new Error(message);
+              },
             };
           },
+          sql,
         };
       }
       return delegate.prepare(sql);

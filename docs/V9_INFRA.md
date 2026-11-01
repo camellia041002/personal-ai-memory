@@ -20,12 +20,13 @@ With `V9_AUTH_MODE=shadow` and `V9_INFRA_ENABLED=true`, isolated clients can use
 - mutation, borrow, recycle-list, and aggregate legacy observations are recorded without memory bodies;
 - pending mutation audits and interrupted recycle cleanup have explicit administrator reconciliation operations;
 - permanent deletion is an exact, confirmed single-record administrator action. `purge_after` is retention metadata only; this branch does not schedule automatic purge.
+- `rename_memory` changes one ordinary key without changing its body or access space. It requires an explicit source mapping, same-space `write` and `delete` grants, an initialized protected-key list, an unused target, two mutation locks, and a durable rename journal. Daily, event, non-archive history, recycled, protected-prefix, and protected exact keys fail closed.
 
 Isolated URL authentication is default-off per client and requires both the Infra flag and an explicit policy allow. Bearer authentication remains the preferred isolated-client route.
 
 ## Data and migration
 
-`migrations/0003_v9_infra.sql` is additive and follows the public `0002` baseline. It creates generic policy, borrow-scope, recycle, audit, and aggregate-observation tables. It does not replay environment-specific migration history and contains no deployment-specific client roles or resource identifiers.
+`migrations/0003_v9_infra.sql` is additive and follows the public `0002` baseline. It creates generic policy, borrow-scope, recycle, audit, and aggregate-observation tables. `migrations/0004_v9_memory_rename.sql` adds only generic rename policy, protected-key, and journal state and starts with rename protection disabled. Neither migration replays environment-specific history or contains deployment-specific client roles or resource identifiers.
 
 The feature flag must remain off until the migration is applied. With `V9_INFRA_ENABLED=false`, the Worker uses the earlier V9 authentication query and does not require the new tables, preserving the existing V8/V9-baseline contract. The V8 deploy script applies every bundled migration, including `0002` and `0003`; creating those tables does not enable V9 while all V9 flags remain off.
 
@@ -39,7 +40,9 @@ KV, D1, and Vectorize do not provide a shared transaction. The implementation th
 4. D1 records success only after the required derived work completes.
 5. Pending reconciliation and recycle repair classify or repair interrupted work.
 
-This prevents a half-restored key from becoming visible, but it is not distributed atomicity. Administrators must use the explicit repair or exact purge endpoint when an interrupted operation needs attention.
+Rename follows the same boundary: it creates and indexes the target before committing the authoritative D1 mapping change, then removes the old KV/vector artifacts. Interrupted pre-commit work is rolled back; interrupted post-commit cleanup remains hidden behind an unresolved journal record until the confirmed administrator reconcile operation finishes it.
+
+This prevents a half-restored key from becoming visible, but it is not distributed atomicity. Administrators must use the explicit repair, rename reconcile, or exact purge endpoint when an interrupted operation needs attention.
 
 ## Deliberate exclusions
 

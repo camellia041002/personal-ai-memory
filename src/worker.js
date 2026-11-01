@@ -41,6 +41,7 @@ const TOOL_CAPABILITIES = Object.freeze({
   recall_memory: "recall",
   report_recall_feedback: "recall",
   delete_memory: "delete",
+  rename_memory: "rename",
   restore_memory: "delete",
   list_recycle_bin: "delete",
   borrow_memory: "borrow",
@@ -222,6 +223,21 @@ const TOOLS = [
     },
   },
   {
+    name: "rename_memory",
+    description: "Rename one ordinary memory key in place without changing its access space or body. Requires write and delete grants for the same space.",
+    v9InfraOnly: true,
+    inputSchema: {
+      type: "object",
+      properties: {
+        key: { type: "string", maxLength: LIMITS.key },
+        newKey: { type: "string", maxLength: LIMITS.key },
+        confirmKey: { type: "string", maxLength: LIMITS.key },
+      },
+      required: ["key", "newKey", "confirmKey"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "list_recycle_bin",
     description: "List metadata-only recycle records visible through this client's current delete grants. Never returns memory bodies, client IDs, or content hashes.",
     v9InfraOnly: true,
@@ -281,6 +297,7 @@ async function callTool(name, args, env, auth) {
     case "recall_memory": return recallMemory(args, env, auth);
     case "report_recall_feedback": return reportRecallFeedback(args, env, auth);
     case "delete_memory": return deleteMemory(args, env, auth);
+    case "rename_memory": return renameMemory(args, env, auth);
     case "list_recycle_bin": return listRecycleBin(args, env, auth);
     case "restore_memory": return restoreMemory(args, env, auth);
     case "borrow_memory": return borrowMemory(args, env, auth);
@@ -296,6 +313,7 @@ async function saveMemory(args, env, auth) {
     : null;
   let auditId = null;
   try {
+    if (infraEnabled(env)) await assertRenameMutationAllowed(env.DB, key);
     if (infraEnabled(env)) await assertKeyNotRecycled(env, key);
     let spaceId = await indexSpaceForRequest(auth, key, env);
     let existingValue = null;
@@ -393,7 +411,7 @@ async function saveDaily(args, env, auth) {
 async function getMemory({ key }, env, auth) {
   validateKeyValue(key, "");
   if (!auth.legacy) await requireKeyCapability(auth, key, "read", env);
-  if (infraEnabled(env) && await isKeyRecycled(env, key)) return `Not found: ${key}`;
+  if (infraEnabled(env) && (await isKeyRecycled(env, key) || await isRenameKeyHidden(env.DB, key))) return `Not found: ${key}`;
   const value = await env.MEMORY.get(key);
   return value === null ? `Not found: ${key}` : value;
 }
@@ -409,7 +427,8 @@ async function findMemoryKeys(args, env, auth) {
   const limit = clampInt(args.limit, 10, 1, LIMITS.findKeys);
   const listedKeys = await listAllKeys(env.MEMORY, { prefix: prefix?.trim() || undefined });
   const recycled = infraEnabled(env) ? await readActiveRecycledKeySet(env, listedKeys) : new Set();
-  const keys = listedKeys.filter((key) => !recycled.has(key));
+  const hidden = infraEnabled(env) ? await readHiddenRenameKeySet(env.DB, listedKeys) : new Set();
+  const keys = listedKeys.filter((key) => !recycled.has(key) && !hidden.has(key));
   const needle = query?.trim().toLocaleLowerCase("zh-CN");
   const candidates = [];
   for (const key of keys) {
@@ -449,7 +468,8 @@ async function getRecentDailies(args, env, auth) {
   const days = clampInt(args.days, 3, 1, LIMITS.recentDays);
   const listedKeys = await listAllKeys(env.MEMORY);
   const recycled = infraEnabled(env) ? await readActiveRecycledKeySet(env, listedKeys) : new Set();
-  const keys = listedKeys.filter((key) => !recycled.has(key));
+  const hidden = infraEnabled(env) ? await readHiddenRenameKeySet(env.DB, listedKeys) : new Set();
+  const keys = listedKeys.filter((key) => !recycled.has(key) && !hidden.has(key));
   const matches = keys.map((key) => ({ key, meta: classifyKey(key) }))
     .filter(({ meta }) => meta.category === "daily" && (owner === "all" || meta.owner === owner))
     .sort((left, right) => right.meta.date.localeCompare(left.meta.date) || left.key.localeCompare(right.key));
@@ -653,7 +673,7 @@ async function hybridSearch(args, env, { spaceIds = null, tolerant = false } = {
   const perKey = new Map();
   const results = [];
   for (const item of [...candidates.values()].sort((left, right) => right.score - left.score)) {
-    if (infraEnabled(env) && await isKeyRecycled(env, item.key)) continue;
+    if (infraEnabled(env) && (await isKeyRecycled(env, item.key) || await isRenameKeyHidden(env.DB, item.key))) continue;
     const count = perKey.get(item.key) || 0;
     if (count >= MAX_RESULTS_PER_KEY) continue;
     perKey.set(item.key, count + 1);
@@ -661,6 +681,183 @@ async function hybridSearch(args, env, { spaceIds = null, tolerant = false } = {
     if (results.length >= FINAL_TOP_K) break;
   }
   return { query, results, retrieval };
+}
+
+async function renameMemory({ key, newKey, confirmKey }, env, auth) {
+  const oldKey = String(key || "");
+  const targetKey = String(newKey || "");
+  validateKeyValue(oldKey, "");
+  validateKeyValue(targetKey, "");
+  if (confirmKey !== oldKey) throw new Error("confirmKey must exactly match key");
+  if (oldKey === targetKey) throw new Error("newKey must differ from key");
+  assertRenameKeyShape(oldKey);
+  assertRenameKeyShape(targetKey);
+
+  const locks = await acquireKeyMutationLocks(env.DB, [oldKey, targetKey]);
+  const operationId = crypto.randomUUID();
+  let committed = false;
+  let targetCreated = false;
+  let oldVectorIds = [];
+  let indexResult = null;
+  try {
+    if (infraEnabled(env)) await assertRenameMutationAllowed(env.DB, key);
+    const sourceMapping = await readKeySpace(env.DB, oldKey);
+    if (!sourceMapping || sourceMapping.disabled_at) throw new Error("source key requires an active explicit access-space mapping");
+    if (!auth.legacy) {
+      assertSpaceCapability(auth, sourceMapping.space_id, "write");
+      assertSpaceCapability(auth, sourceMapping.space_id, "delete");
+    }
+    await assertRenameProtectionReady(env.DB, oldKey, targetKey);
+    await assertRenameSourceAndTargetAvailable(env, oldKey, targetKey);
+    const value = await env.MEMORY.get(oldKey);
+    if (value === null) throw new Error("source key does not exist");
+    const contentHash = await sha256Hex(value);
+    const sourceState = await env.DB.prepare(
+      "SELECT content_hash, vector_ids_json FROM memory_index_state WHERE memory_key = ?",
+    ).bind(oldKey).first();
+    if (sourceState?.content_hash && sourceState.content_hash !== contentHash) {
+      throw new Error("source body does not match its index; reindex before renaming");
+    }
+    oldVectorIds = parseVectorIds(sourceState?.vector_ids_json);
+    await env.DB.prepare(
+      `INSERT INTO memory_rename_journal
+       (operation_id, old_key, new_key, space_id, client_id, auth_kind, content_hash,
+        old_vector_ids_json, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')`,
+    ).bind(operationId, oldKey, targetKey, sourceMapping.space_id, auth.clientId || null,
+      auth.kind || "unknown", contentHash, JSON.stringify(oldVectorIds)).run();
+
+    await env.MEMORY.put(targetKey, value);
+    targetCreated = true;
+    indexResult = await indexMemory(targetKey, value, env, sourceMapping.space_id);
+    const targetState = await env.DB.prepare(
+      "SELECT vector_ids_json FROM memory_index_state WHERE memory_key = ?",
+    ).bind(targetKey).first();
+    await env.DB.prepare(
+      "UPDATE memory_rename_journal SET new_vector_ids_json=? WHERE operation_id=? AND status='pending'",
+    ).bind(JSON.stringify(parseVectorIds(targetState?.vector_ids_json)), operationId).run();
+
+    const results = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE memory_rename_journal SET status='committed', committed_at=CURRENT_TIMESTAMP
+         WHERE operation_id=? AND status='pending'
+           AND EXISTS (SELECT 1 FROM memory_key_spaces WHERE memory_key=? AND space_id=?)
+           AND NOT EXISTS (SELECT 1 FROM memory_key_spaces WHERE memory_key=?)
+           AND EXISTS (SELECT 1 FROM memory_key_operation_locks WHERE memory_key=? AND lock_id=? AND datetime(expires_at)>CURRENT_TIMESTAMP)
+           AND EXISTS (SELECT 1 FROM memory_key_operation_locks WHERE memory_key=? AND lock_id=? AND datetime(expires_at)>CURRENT_TIMESTAMP)`,
+      ).bind(operationId, oldKey, sourceMapping.space_id, targetKey,
+        locks[0].key, locks[0].lockId, locks[1].key, locks[1].lockId),
+      env.DB.prepare(
+        `UPDATE memory_key_spaces SET memory_key=?, updated_at=CURRENT_TIMESTAMP
+         WHERE memory_key=? AND space_id=?
+           AND EXISTS (SELECT 1 FROM memory_rename_journal WHERE operation_id=? AND status='committed')`,
+      ).bind(targetKey, oldKey, sourceMapping.space_id, operationId),
+      env.DB.prepare(
+        `DELETE FROM memory_chunks WHERE memory_key=?
+         AND EXISTS (SELECT 1 FROM memory_rename_journal WHERE operation_id=? AND status='committed')`,
+      ).bind(oldKey, operationId),
+      env.DB.prepare(
+        `DELETE FROM memory_index_state WHERE memory_key=?
+         AND EXISTS (SELECT 1 FROM memory_rename_journal WHERE operation_id=? AND status='committed')`,
+      ).bind(oldKey, operationId),
+    ]);
+    if (Number(results[0]?.meta?.changes || 0) !== 1 || Number(results[1]?.meta?.changes || 0) !== 1) {
+      throw new Error("rename commit did not take effect");
+    }
+    committed = true;
+    return finishCommittedRename(env, { operationId, oldKey, targetKey, oldVectorIds, indexResult });
+  } catch (error) {
+    if (!committed) {
+      const status = await readRenameJournalStatus(env.DB, operationId);
+      if (new Set(["committed", "reconcile_required"]).has(status)) {
+        return finishCommittedRename(env, { operationId, oldKey, targetKey, oldVectorIds, indexResult });
+      }
+      let rollbackFailed = false;
+      try {
+        if (targetCreated) await removeMemoryEverywhere(targetKey, env, true, false);
+      } catch { rollbackFailed = true; }
+      try {
+        await updateRenameJournal(env.DB, operationId,
+          rollbackFailed ? "rollback_required" : "rolled_back", error, ["pending", "rollback_required"]);
+      } catch {}
+    }
+    throw error;
+  } finally {
+    await releaseKeyMutationLocks(env.DB, locks);
+  }
+}
+
+async function finishCommittedRename(env, { operationId, oldKey, targetKey, oldVectorIds, indexResult }) {
+  try {
+    if (oldVectorIds.length) await env.VECTORIZE_INDEX.deleteByIds(oldVectorIds);
+    await env.MEMORY.delete(oldKey);
+    await updateRenameJournal(env.DB, operationId, "success", null, ["committed", "reconcile_required"]);
+    return { key: oldKey, newKey: targetKey, renamed: true, index: indexResult?.index || "ok", cleanup: "ok", referencesUpdated: false };
+  } catch (error) {
+    await updateRenameJournal(env.DB, operationId, "reconcile_required", error, ["committed", "reconcile_required"]);
+    return { key: oldKey, newKey: targetKey, renamed: true, index: indexResult?.index || "ok", cleanup: "pending", referencesUpdated: false };
+  }
+}
+
+function assertRenameKeyShape(key) {
+  const meta = classifyKey(key);
+  const normalized = key.normalize("NFKC").toLowerCase();
+  const archiveShape = normalized.startsWith("archive_");
+  if (new Set(["daily", "event"]).has(meta.category)
+    || (meta.category === "history" && !archiveShape)
+    || /(?:^|_)(?:daily|event|history)(?:_|$)/u.test(normalized)) {
+    throw new Error("daily, event, and history keys cannot be renamed");
+  }
+  if (/^(?:obsolete_|tool_)/u.test(normalized)) throw new Error("protected-prefix keys cannot be renamed");
+}
+
+async function assertRenameProtectionReady(db, oldKey, newKey) {
+  const state = await db.prepare(
+    "SELECT protected_keys_ready FROM memory_rename_policy_state WHERE singleton=1",
+  ).first();
+  if (Number(state?.protected_keys_ready || 0) !== 1) throw new Error("rename protection list is not ready");
+  const row = await db.prepare(
+    "SELECT memory_key FROM memory_rename_protected_keys WHERE memory_key IN (?, ?) LIMIT 1",
+  ).bind(oldKey, newKey).first();
+  if (row) throw new Error("protected continuity keys cannot be renamed");
+}
+
+async function assertRenameSourceAndTargetAvailable(env, oldKey, newKey) {
+  if (await isKeyRecycled(env, oldKey) || await isKeyRecycled(env, newKey)) {
+    throw new Error("recycled keys cannot participate in rename");
+  }
+  const [targetValue, targetState, targetMapping, unresolved] = await Promise.all([
+    env.MEMORY.get(newKey),
+    env.DB.prepare("SELECT memory_key FROM memory_index_state WHERE memory_key=?").bind(newKey).first(),
+    readKeySpace(env.DB, newKey),
+    env.DB.prepare(
+      `SELECT operation_id FROM memory_rename_journal
+       WHERE (old_key IN (?, ?) OR new_key IN (?, ?))
+         AND status IN ('pending','committed','rollback_required','reconcile_required') LIMIT 1`,
+    ).bind(oldKey, newKey, oldKey, newKey).first(),
+  ]);
+  if (targetValue !== null || targetState || targetMapping) throw new Error("newKey already exists");
+  if (unresolved) throw new Error("one of the keys has an unresolved rename operation");
+}
+
+function parseVectorIds(value) {
+  try { const parsed = JSON.parse(String(value || "[]")); return Array.isArray(parsed) ? parsed : []; }
+  catch { return []; }
+}
+
+async function readRenameJournalStatus(db, operationId) {
+  if (!operationId) return null;
+  const row = await db.prepare("SELECT status FROM memory_rename_journal WHERE operation_id=?")
+    .bind(operationId).first();
+  return row?.status || null;
+}
+
+async function updateRenameJournal(db, operationId, status, error = null, expected = []) {
+  const suffix = expected.length ? ` AND status IN (${expected.map(() => "?").join(",")})` : "";
+  const result = await db.prepare(
+    `UPDATE memory_rename_journal SET status=?, error_class=?, completed_at=CURRENT_TIMESTAMP
+     WHERE operation_id=?${suffix}`,
+  ).bind(status, error ? errorClass(error) : null, operationId, ...expected).run();
+  if (Number(result.meta?.changes || 0) !== 1) throw new Error("rename journal could not be completed");
 }
 
 async function deleteMemory({ key, confirmKey }, env, auth) {
@@ -671,6 +868,7 @@ async function deleteMemory({ key, confirmKey }, env, auth) {
     ? await acquireKeyMutationLock(env.DB, key)
     : null;
   try {
+    if (infraEnabled(env)) await assertRenameMutationAllowed(env.DB, key);
     if (infraEnabled(env) && auth.legacy && await readActiveRecycleRow(env.DB, key)) {
       throw new Error("active recycle records require restore or explicit administrator purge");
     }
@@ -685,6 +883,7 @@ async function deleteMemory({ key, confirmKey }, env, auth) {
 async function softDeleteMemory(key, env, auth) {
   const lockId = await acquireKeyMutationLock(env.DB, key);
   try {
+    await assertRenameMutationAllowed(env.DB, key);
     const mapping = auth.legacy
       ? await readKeySpace(env.DB, key)
       : await requireKeyCapability(auth, key, "delete", env);
@@ -833,6 +1032,7 @@ async function restoreMemory({ key, deletionId, confirmKey }, env, auth) {
   const lockId = await acquireKeyMutationLock(env.DB, key);
   let operationId = null;
   try {
+    await assertRenameMutationAllowed(env.DB, key);
     const recycled = await env.DB.prepare(
       `SELECT deletion_id, space_id, content_hash FROM memory_recycle_bin
        WHERE deletion_id=? AND memory_key=? AND status='active'`,
@@ -993,6 +1193,7 @@ async function handleAdmin(request, env, url) {
         ? await acquireKeyMutationLock(env.DB, key)
         : null;
       try {
+        if (infraEnabled(env)) await assertRenameMutationAllowed(env.DB, key);
         if (infraEnabled(env)) await assertKeyNotRecycled(env, key);
         const value = await env.MEMORY.get(key);
         if (value === null) throw new Error("key does not exist in KV");
@@ -1188,6 +1389,7 @@ async function handleV9Admin(pathname, body, env) {
     requireConfirmation(body.confirmKey, key, "confirmKey");
     const lockId = await acquireKeyMutationLock(env.DB, key);
     try {
+      if (infraEnabled(env)) await assertRenameMutationAllowed(env.DB, key);
       if (infraEnabled(env) && await readActiveRecycleRow(env.DB, key)) {
         throw new Error("cannot reassign an actively recycled key");
       }
@@ -1246,6 +1448,16 @@ async function handleV9Admin(pathname, body, env) {
     if (!infraEnabled(env)) throw new Error("V9 infrastructure is disabled");
     requireBooleanConfirmation(body.confirmReconcile, "confirmReconcile");
     return reconcilePendingMutationAudits(env, clampInt(body.limit, 50, 1, 100));
+  }
+  if (pathname === "/admin/v9/rename/protection-replace") {
+    if (!infraEnabled(env)) throw new Error("V9 infrastructure is disabled");
+    requireBooleanConfirmation(body.confirmReplace, "confirmReplace");
+    return replaceRenameProtectionList(env, body);
+  }
+  if (pathname === "/admin/v9/rename/reconcile") {
+    if (!infraEnabled(env)) throw new Error("V9 infrastructure is disabled");
+    requireBooleanConfirmation(body.confirmReconcile, "confirmReconcile");
+    return reconcileMemoryRenames(env, clampInt(body.limit, 20, 1, 50));
   }
   if (pathname === "/admin/v9/recycle/repair-active") {
     if (!infraEnabled(env)) throw new Error("V9 infrastructure is disabled");
@@ -1349,6 +1561,48 @@ async function readActiveRecycledKeySet(env, keys) {
     for (const row of rows.results || []) recycled.add(row.memory_key);
   }
   return recycled;
+}
+
+async function isRenameKeyHidden(db, key) {
+  if (!await renameSchemaPresent(db)) return false;
+  const row = await db.prepare(
+    `SELECT operation_id FROM memory_rename_journal WHERE
+       ((new_key=? AND status IN ('pending','rollback_required')) OR
+        (old_key=? AND status IN ('committed','reconcile_required'))) LIMIT 1`,
+  ).bind(key, key).first();
+  return Boolean(row);
+}
+
+async function readHiddenRenameKeySet(db, keys) {
+  const hidden = new Set();
+  if (!await renameSchemaPresent(db)) return hidden;
+  for (let offset = 0; offset < keys.length; offset += 40) {
+    const batch = keys.slice(offset, offset + 40);
+    if (!batch.length) continue;
+    const placeholders = batch.map(() => "?").join(",");
+    const rows = await db.prepare(
+      `SELECT old_key, new_key, status FROM memory_rename_journal WHERE
+         (new_key IN (${placeholders}) AND status IN ('pending','rollback_required')) OR
+         (old_key IN (${placeholders}) AND status IN ('committed','reconcile_required'))`,
+    ).bind(...batch, ...batch).all();
+    for (const row of rows.results || []) {
+      hidden.add(new Set(["pending", "rollback_required"]).has(row.status) ? row.new_key : row.old_key);
+    }
+  }
+  return hidden;
+}
+
+async function assertRenameMutationAllowed(db, key) {
+  if (await isRenameKeyHidden(db, key)) throw new Error("key has an unresolved rename operation");
+}
+
+async function renameSchemaPresent(db) {
+  if (!db) throw new Error("rename schema is unavailable");
+  const row = await db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_rename_journal'",
+  ).first();
+  if (!row) throw new Error("rename migration must be applied before enabling V9 infrastructure");
+  return true;
 }
 
 async function beginMutationAudit(env, auth, action, key, spaceId, {
@@ -1880,11 +2134,14 @@ async function authenticateIsolatedToken(token, env, kind, requireUrlAllowed) {
 }
 
 function visibleTools(auth, env) {
-  if (auth.legacy) return TOOLS.filter((tool) => !tool.v9Only && !tool.v9InfraOnly).map(stripInternalToolFields);
+  if (auth.legacy) return TOOLS.filter((tool) => (
+    (!tool.v9Only && !tool.v9InfraOnly) || (tool.name === "rename_memory" && infraEnabled(env))
+  )).map(stripInternalToolFields);
   return TOOLS.filter((tool) => {
     if (tool.v9Only && !recallEnabled(env)) return false;
     if (tool.v9InfraOnly && !infraEnabled(env)) return false;
     if (tool.name === "borrow_memory") return auth.borrowEnabled && (auth.borrowSpaces || []).length > 0;
+    if (tool.name === "rename_memory") return renameGrantedSpaceIds(auth).length > 0;
     const capability = TOOL_CAPABILITIES[tool.name];
     return capability && grantedSpaceIds(auth, capability).length > 0;
   }).map((tool) => {
@@ -1916,6 +2173,7 @@ function assertToolAuthorized(auth, toolName, env) {
   const tool = TOOLS.find(({ name }) => name === toolName);
   if (!tool) throw new Error(`Unknown tool: ${toolName}`);
   if (auth.legacy) {
+    if (tool.name === "rename_memory" && infraEnabled(env)) return;
     if (tool.v9Only || tool.v9InfraOnly) throw new Error("tool is unavailable on the legacy channel");
     return;
   }
@@ -1925,10 +2183,19 @@ function assertToolAuthorized(auth, toolName, env) {
     if (!auth.borrowEnabled || !(auth.borrowSpaces || []).length) throw new Error("borrow is not enabled");
     return;
   }
+  if (toolName === "rename_memory") {
+    if (!renameGrantedSpaceIds(auth).length) throw new Error("rename requires write and delete grants for the same space");
+    return;
+  }
   const capability = TOOL_CAPABILITIES[toolName];
   if (!capability || !grantedSpaceIds(auth, capability).length) {
     throw new Error("client is not authorized for this tool");
   }
+}
+
+function renameGrantedSpaceIds(auth) {
+  const writable = new Set(grantedSpaceIds(auth, "write"));
+  return grantedSpaceIds(auth, "delete").filter((spaceId) => writable.has(spaceId));
 }
 
 function grantedSpaceIds(auth, capability) {
@@ -1957,7 +2224,7 @@ async function requireSpaceGrant(auth, spaceKey, capability, env) {
 
 async function readKeySpace(db, key) {
   return db.prepare(
-    `SELECT mks.space_id, s.space_key
+    `SELECT mks.space_id, s.space_key, s.disabled_at
      FROM memory_key_spaces mks JOIN memory_spaces s ON s.space_id = mks.space_id
      WHERE mks.memory_key = ?`,
   ).bind(key).first();
@@ -1990,6 +2257,93 @@ async function acquireKeyMutationLock(db, key) {
   ).bind(key, lockId).run();
   if (Number(result.meta?.changes || 0) < 1) throw new Error("another operation is in progress for this key");
   return lockId;
+}
+
+async function acquireKeyMutationLocks(db, keys) {
+  const locks = [];
+  try {
+    for (const key of [...new Set(keys)].sort()) {
+      locks.push({ key, lockId: await acquireKeyMutationLock(db, key) });
+    }
+    return locks;
+  } catch (error) {
+    await releaseKeyMutationLocks(db, locks);
+    throw error;
+  }
+}
+
+async function releaseKeyMutationLocks(db, locks) {
+  for (const { key, lockId } of [...locks].reverse()) await releaseKeyMutationLock(db, key, lockId);
+}
+
+async function replaceRenameProtectionList(env, body) {
+  const sourceVersion = normalizeLabel(body.sourceVersion, "sourceVersion");
+  if (!Array.isArray(body.keys) || !body.keys.length || body.keys.length > 100) {
+    throw new Error("keys must contain 1-100 protected-key entries");
+  }
+  const rows = [];
+  const seen = new Set();
+  for (const item of body.keys) {
+    const key = String(item?.key || "");
+    validateKeyValue(key, "");
+    const reason = normalizeLabel(item?.reason, "reason");
+    if (seen.has(key)) throw new Error("protected keys must be unique");
+    seen.add(key);
+    rows.push({ key, reason });
+  }
+  rows.sort((left, right) => left.key.localeCompare(right.key));
+  const sourceDigest = await sha256Hex(JSON.stringify({ sourceVersion, rows }));
+  await env.DB.prepare(
+    "UPDATE memory_rename_policy_state SET protected_keys_ready=0, updated_at=CURRENT_TIMESTAMP WHERE singleton=1",
+  ).run();
+  const statements = [env.DB.prepare("DELETE FROM memory_rename_protected_keys")];
+  for (const row of rows) statements.push(env.DB.prepare(
+    "INSERT INTO memory_rename_protected_keys (memory_key, reason, source_version) VALUES (?, ?, ?)",
+  ).bind(row.key, row.reason, sourceVersion));
+  statements.push(env.DB.prepare(
+    `UPDATE memory_rename_policy_state SET protected_keys_ready=1, source_version=?, source_digest=?,
+     updated_at=CURRENT_TIMESTAMP WHERE singleton=1 AND protected_keys_ready=0`,
+  ).bind(sourceVersion, sourceDigest));
+  await env.DB.batch(statements);
+  return { protectedKeyCount: rows.length, sourceVersion, sourceDigest, ready: true };
+}
+
+async function reconcileMemoryRenames(env, limit) {
+  const rows = await env.DB.prepare(
+    `SELECT operation_id, old_key, new_key, status, content_hash, old_vector_ids_json
+     FROM memory_rename_journal
+     WHERE status IN ('rollback_required','committed','reconcile_required')
+        OR (status='pending' AND datetime(started_at)<=datetime('now','-20 minutes'))
+     ORDER BY started_at, operation_id LIMIT ?`,
+  ).bind(limit).all();
+  const summary = { examined: 0, repaired: 0, blocked: 0 };
+  for (const row of rows.results || []) {
+    summary.examined += 1;
+    let locks = [];
+    try {
+      locks = await acquireKeyMutationLocks(env.DB, [row.old_key, row.new_key]);
+      if (new Set(["pending", "rollback_required"]).has(row.status)) {
+        if (await readKeySpace(env.DB, row.new_key)) throw new Error("target mapping is authoritative");
+        const targetValue = await env.MEMORY.get(row.new_key);
+        if (targetValue !== null && await sha256Hex(targetValue) !== row.content_hash) {
+          throw new Error("target body changed");
+        }
+        await removeMemoryEverywhere(row.new_key, env, targetValue !== null, false);
+        await updateRenameJournal(env.DB, row.operation_id, "rolled_back", null, ["pending", "rollback_required"]);
+      } else {
+        if (await readKeySpace(env.DB, row.old_key)) throw new Error("source mapping is still authoritative");
+        const oldValue = await env.MEMORY.get(row.old_key);
+        if (oldValue !== null && await sha256Hex(oldValue) !== row.content_hash) throw new Error("source body changed");
+        const ids = parseVectorIds(row.old_vector_ids_json);
+        if (ids.length) await env.VECTORIZE_INDEX.deleteByIds(ids);
+        if (oldValue !== null) await env.MEMORY.delete(row.old_key);
+        await updateRenameJournal(env.DB, row.operation_id, "success", null, ["committed", "reconcile_required"]);
+      }
+      summary.repaired += 1;
+    } catch { summary.blocked += 1; }
+    finally { await releaseKeyMutationLocks(env.DB, locks); }
+  }
+  return summary;
 }
 
 async function releaseKeyMutationLock(db, key, lockId) {

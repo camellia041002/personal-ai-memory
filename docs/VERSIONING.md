@@ -10,7 +10,7 @@ Lite and Hybrid V8 are the currently deployable public choices. V9 is under deve
 
 | Module | Fixed scope | Public status |
 | --- | --- | --- |
-| V9-Infra | Client identity, access spaces, grants, authentication, audit, data lifecycle, and default-off server recall tools | Development branch `codex/v9-infra`; verified but not ready for deployment |
+| V9-Infra | Client identity, access spaces, grants, authentication, audit, data lifecycle, guarded same-space key rename, and default-off server recall tools | Development branch `codex/v9-infra`; locally verified candidate, not ready for deployment, merged, or released |
 | V9.1 | Client-side contextual recall trigger, query construction, filtering, injection, and experience acceptance | In development; not yet in the repository. Planned to ship with V9 when V9 replaces V8 on `main` |
 | V9.2 | Deterministic low-frequency surfacing | Not started publicly |
 | V9.3 | Generic configuration, install/upgrade, migration, rollback, documentation, and release candidate | Not started publicly |
