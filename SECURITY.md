@@ -1,5 +1,7 @@
 # Security
 
+[返回项目首页](README.md) · [查看完整文档导航](docs/README.md)
+
 ## Lite authentication
 
 首页默认部署的 Lite 只使用一个 Cloudflare Secret：`MEMORY_TOKEN`。同一个普通权限 Token 可通过两种载体使用：精确路径 `/mcp` 的 `Authorization: Bearer <MEMORY_TOKEN>`，或只支持 URL 的客户端使用精确路径 `/mcp/<MEMORY_TOKEN>`。Lite 没有管理员端点，因此不存在普通权限与管理员权限混用。

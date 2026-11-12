@@ -1,5 +1,7 @@
 # Client connections
 
+[返回项目首页](README.md) · [查看完整文档导航](docs/README.md)
+
 ## Lite（首页默认）
 
 Lite 只需要一个 `MEMORY_TOKEN`：

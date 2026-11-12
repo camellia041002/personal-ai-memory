@@ -1,5 +1,7 @@
 # 给 AI 部署索引版或 Hybrid V8 的提示词
 
+[返回项目首页](../README.md) · [返回文档导航](README.md)
+
 索引版比 Lite 多出 Workers AI 与 Vectorize；Hybrid V8 还需要 D1 和数据库迁移。第一次使用建议先部署 Lite。确定需要按语义搜索后，再把下面提示词交给 AI，并把“目标档位”改成你选择的版本。
 
 ```text

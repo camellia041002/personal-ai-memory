@@ -1,5 +1,7 @@
 # 安全生成 MEMORY_TOKEN
 
+[返回项目首页](../README.md) · [返回文档导航](README.md)
+
 `MEMORY_TOKEN` 控制整个 Lite 记忆库的读写权限。它应当：
 
 - 只用于这个记忆库；

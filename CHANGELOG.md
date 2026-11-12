@@ -1,9 +1,12 @@
 # Changelog
 
+[返回项目首页](README.md) · [查看完整文档导航](docs/README.md)
+
 本记录来自私人归档中保存的 V1—V8 源码与随附说明。V1—V7 的完整原始源码不进入公开仓库；日期仅在归档或项目背景能够证明时列出。
 
 ## Unreleased
 
+- 新增统一的公开文档导航，并为主要说明页补充返回首页和文档目录的入口。
 - 将项目定位改为不绑定单一 AI 的外置 MCP 记忆系统：一个 AI 可独立使用，多个客户端可选共用，并说明 key 前缀是分类而不是权限隔离。
 - 新增独立 `v8` Deploy to Cloudflare 包，声明自动创建 KV、D1、Vectorize、Workers AI，部署时执行 D1 migration 并请求建立三项 metadata indexes。
 - 新 V8 部署使用同一个 `MEMORY_TOKEN` 支持 Bearer 与单 URL，管理员接口继续使用独立的 `ADMIN_TOKEN`；旧 `AUTH_TOKEN` / `MCP_URL_TOKEN` 配置保持兼容。

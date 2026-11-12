@@ -1,5 +1,7 @@
 # 给 AI 部署 Lite 的提示词
 
+[返回项目首页](../README.md) · [返回文档导航](README.md)
+
 把下面整段交给你信任的 AI 编程助手。优先让它引导你使用仓库首页的 Cloudflare 部署按钮；这条路线不需要把 Cloudflare API Token 发给 AI。
 
 ```text

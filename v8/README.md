@@ -1,5 +1,7 @@
 # personal-ai-memory V8
 
+[返回项目首页](../README.md) · [查看完整文档导航](../docs/README.md)
+
 V8 是带混合搜索和索引恢复能力的完整版本。它仍是一个部署在你自己 Cloudflare 账号里的外置 MCP 记忆系统；一个 AI 可以使用，也可以让多个支持远程 MCP 的客户端连接同一份记忆。
 
 > [!WARNING]

@@ -1,5 +1,7 @@
 # Architecture
 
+[返回项目首页](README.md) · [查看完整文档导航](docs/README.md)
+
 公开版默认入口是 Lite：一个 Worker 通过 MCP 暴露四个受限工具，KV 是唯一存储。它不生成 embedding，也没有 D1、Vectorize 或管理员端点。
 
 需要语义检索时可选择 Vector search，它使用 KV、Workers AI 和 Vectorize。Hybrid V8 再加入 D1，用于精确短语候选、当前 chunk 校验和索引状态恢复。三档都是安全整理后的公开实现，不是历史源码的原样副本。

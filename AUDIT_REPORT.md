@@ -1,5 +1,7 @@
 # Source audit report
 
+[返回项目首页](README.md) · [查看完整文档导航](docs/README.md)
+
 > 本报告记录首次公开发布时的审计结论。后续工作区在不恢复查询参数、全量读取或管理员权限混用的前提下，重新加入了可选的严格路径 Token；当前行为以 README、SECURITY 和 Unreleased changelog 为准。
 
 ## Scope and method
