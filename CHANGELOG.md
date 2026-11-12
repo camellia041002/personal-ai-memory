@@ -6,6 +6,7 @@
 
 ## Unreleased
 
+- 增加 GitHub Actions，在公开 `main` 与 Pull Request 上运行完整 `npm run check`；`8.0.0-public.2` 仍是当前未单独创建 Release 的源码版本，最新已发布 Release 保持 `v8.0.0-public.1`。
 - 新增统一的公开文档导航，并为主要说明页补充返回首页和文档目录的入口。
 - 将项目定位改为不绑定单一 AI 的外置 MCP 记忆系统：一个 AI 可独立使用，多个客户端可选共用，并说明 key 前缀是分类而不是权限隔离。
 - 新增独立 `v8` Deploy to Cloudflare 包，声明自动创建 KV、D1、Vectorize、Workers AI，部署时执行 D1 migration 并请求建立三项 metadata indexes。
